@@ -1,0 +1,6 @@
+/* Additive image-generation styles only. */
+.orb-image-generating .core-shell{animation:jarvisImageCoreSpin 1.25s linear infinite;box-shadow:0 0 28px rgba(0,150,255,.55),inset 0 0 55px rgba(0,90,255,.30)}
+.jarvis-inline-image-actions{position:absolute;left:50%;bottom:12%;transform:translateX(-50%);display:flex;gap:7px;z-index:50}
+.jarvis-inline-image-actions button{border:1px solid rgba(90,190,255,.65);border-radius:7px;background:rgba(2,24,45,.92);color:#bfeeff;padding:7px 12px;font-size:9px;letter-spacing:.14em;cursor:pointer}
+.jarvis-inline-image-actions button.remove{border-color:rgba(255,130,130,.4);color:#ffcaca}
+@keyframes jarvisImageCoreSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}

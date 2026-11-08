@@ -1,3 +1,66 @@
+# Local credentials and private state
+.env*
+.jarvis_mobile_token
+*.token
+*.pem
+*.key
+*.p12
+*.pfx
+.jarvis_security/
+.jarvis_backups/
+memory.json
+study_progress.json
+voice_cache/
+generated_images/
+jarvis_social_session/
+jarvis_whatsapp_session/
+qwen3-4b-openvino/
+
+# Environments, dependencies, caches, and build output
+.venv/
+venv/
+env/
+node_modules/
+dist/
+build/
+target/
+coverage/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+__pycache__/
+
+# Temporary files, logs, and snapshots
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.bak.*
+*.old
+*.backup
+*.backup.*
+*.errors.txt
+**/*backup*/
+**/*BACKUP*/
+backups/
+
+# Generated or bulky artifacts
+*.exe
+*.dll
+*.onnx
+*.zip
+*.db
+*.db-journal
+*.db-wal
+*.mp3
+*.wav
+*.bin
+!JARVIS_HUD_V2/public/jarvis_avatar/Superhero_Male_FullBody.bin
+JARVIS_HUD_V2/public/jarvis-generated.png
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

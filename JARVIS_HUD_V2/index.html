@@ -1,0 +1,22 @@
+﻿<!doctype html><html><head>
+<link rel="manifest" href="/jarvis-real-pwa.webmanifest" id="jarvis-real-pwa">
+<meta name="theme-color" content="#05070b">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>JARVIS REAL DASHBOARD</title><script>
+(function(){
+  function fitJarvisMobile(){
+    if(window.innerWidth <= 900 && window.innerWidth > window.innerHeight){
+      const scale = Math.min(window.innerWidth / 1180, window.innerHeight / 700);
+      document.documentElement.style.setProperty("--jarvis-mobile-scale", String(scale));
+    } else {
+      document.documentElement.style.setProperty("--jarvis-mobile-scale","1");
+    }
+  }
+  window.addEventListener("resize",fitJarvisMobile);
+  window.addEventListener("orientationchange",function(){setTimeout(fitJarvisMobile,150);});
+  fitJarvisMobile();
+})();
+</script></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script>  <script type="module" src="/src/spotify-callback.js"></script>`r`n</body></html>
+
+
+
