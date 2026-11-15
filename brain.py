@@ -698,6 +698,15 @@ def _is_routine_query(c):
 
 def understand(text):
     original = text.strip()
+    # Route explicit WhatsApp actions before generic AI/chat handling.
+    # Do not rely on later routing branches to reach the call handler.
+    try:
+        from jarvis_whatsapp_controls import parse_command as parse_whatsapp_command
+        whatsapp_action = parse_whatsapp_command(original)
+        if whatsapp_action:
+            return whatsapp_action
+    except Exception as error:
+        print(f"[WHATSAPP ROUTE] {type(error).__name__}: {error}", flush=True)
     c = norm(original)
 
     # Remove an optional wake-word prefix when the active command
