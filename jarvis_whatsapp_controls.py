@@ -100,6 +100,9 @@ def perform_call(agent: Any, contact: str, video: bool = False) -> tuple[bool, s
         if not ok:
             return False, detail
         page = agent.page
+        header = page.locator("#main header")
+        if not header.count() or not header.get_by_text(contact, exact=True).count():
+            return False, "Contact header verify nahi hua; call nahi ki."
         page.wait_for_timeout(300)
         desired = "video" if video else "voice"
         buttons = page.get_by_role("button")
@@ -122,7 +125,7 @@ def perform_call(agent: Any, contact: str, video: bool = False) -> tuple[bool, s
                 if match:
                     button.click(timeout=2500)
                     page.wait_for_timeout(500)
-                    return True, f"WhatsApp {'video' if video else 'voice'} call {contact} ko start kar diya."
+                    return True, f"WhatsApp {desired} call button click hua; ringing/connection verify nahi hui."
             except Exception:
                 continue
         return False, "Contact chat khul gaya, lekin WhatsApp Web ka call button verify nahi hua. Call manually start karo."
