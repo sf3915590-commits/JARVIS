@@ -39,6 +39,8 @@ class WhatsAppAgent:
                     return True
             except Exception:
                 pass
+        if self.playwright:
+            self._disconnect_only()
 
         try:
             self.playwright = sync_playwright().start()
@@ -50,7 +52,7 @@ class WhatsAppAgent:
             if not contexts:
                 raise RuntimeError("Existing Edge ka browser context nahi mila.")
 
-            self.context = contexts[0]
+            self.context = next((ctx for ctx in contexts if any("web.whatsapp.com" in (p.url or "").lower() for p in ctx.pages)), contexts[0])
 
             # Prefer an already-open WhatsApp Web tab.
             whatsapp_pages = []
@@ -303,21 +305,28 @@ class WhatsAppAgent:
             if not opened:
                 return False, open_message
 
+            header = self.page.locator("#main header")
+            if not header.count() or not header.get_by_text(name, exact=True).count():
+                return False, "Contact header verify nahi hua; message send nahi kiya."
             message_box = self._get_message_box()
             if message_box is None:
                 return False, "Boss, WhatsApp message box nahi mila."
 
-            message_box.click(force=True)
+            outgoing = self.page.locator("#main .message-out").filter(has_text=message)
+            before = outgoing.count()
+            message_box.click()
             message_box.fill(message)
-            self.page.wait_for_timeout(250)
             message_box.press("Enter")
-            self.page.wait_for_timeout(700)
-
-            print(
-                f"💬 WhatsApp sent to {name}: {message}",
-                flush=True,
-            )
-            return True, "Message successfully sent."
+            try:
+                self.page.wait_for_function(
+                    """({text, before}) => [...document.querySelectorAll('#main .message-out')]
+                        .filter(el => el.innerText.includes(text)).length > before""",
+                    arg={"text": message, "before": before},
+                    timeout=6000,
+                )
+            except Exception:
+                return False, "Send confirm nahi hua. Automatic retry nahi kiya; duplicate se bachne ke liye chat check karo."
+            return True, "Message outgoing chat mein nazar aa gaya; delivery/read confirm nahi hai."
 
         except PlaywrightTimeoutError:
             return False, "Boss, WhatsApp Web response nahi de raha."
