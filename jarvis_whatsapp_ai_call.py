@@ -235,12 +235,12 @@ class EndpointVAD:
             self.run = self.run + 1 if speech else 0
             if not speech:
                 self.noise = .98 * self.noise + .02 * min(rms, .01)
-            if self.run >= 5:
+            if self.run >= 4:
                 self.frames = list(self.pre)
             return None
         self.frames.append(frame)
         self.silence = 0 if speech else self.silence + 1
-        if self.silence * self.frame_ms >= 700 or len(self.frames) * self.frame_ms >= 15000:
+        if self.silence * self.frame_ms >= 500 or len(self.frames) * self.frame_ms >= 12000:
             result = np.concatenate(self.frames)
             self.__init__(self.rate, self.frame_ms)
             return result
@@ -505,6 +505,7 @@ class CallController:
         self.last_error = ''
         self._owns_agent = agent is None
         self._unknown_since = None
+        self._last_ui_check = 0.0
         self._stage = 'idle'
         self._intro_audio = None
         self._filler_audio = None
@@ -524,6 +525,15 @@ class CallController:
         if self.stop.is_set():
             raise InterruptedError()
         if self.dialed:
+            now = time.monotonic()
+            # Calls to Playwright's WhatsApp DOM can block for >1 second.
+            # A forced DOM read on each 20ms audio packet starved the
+            # PortAudio capture loop. Throttle probes when connected;
+            # the capture itself now runs in a dedicated worker thread.
+            interval = 1.2 if self.connected else 0.35
+            if now - self._last_ui_check < interval:
+                return
+            self._last_ui_check = now
             try:
                 state = self.ui.sample()
             except Exception as exc:
@@ -585,41 +595,44 @@ class CallController:
             path.write_bytes(data)
             self.audio.play(path, self.stop, self.tick)
 
-    def think_and_say(self, text):
-        """Start the next natural reply promptly; never insert artificial silence.
+    def transcribe_with_ack(self, audio):
+        """Acknowledge speech immediately while Whisper runs concurrently.
 
-        If the model is still thinking at 1.35 seconds, play one pre-rendered
-        acknowledgement on the call's TTS route. Always speak the real answer
-        afterwards. Keep all WhatsApp DOM checks on the owning thread.
+        The old implementation waited for STT plus model thinking before
+        playing its filler. This plays the pre-rendered phrase as soon as a
+        voice turn ends; never sends an additional filler after THINKING.
         """
-        results = queue.Queue(maxsize=1)
+        result = queue.Queue(maxsize=1)
 
-        def generate():
+        def transcribe():
             try:
-                results.put((True, self.brain.reply(text)))
+                result.put((True, self.audio.transcribe(audio)))
             except Exception as exc:
-                results.put((False, exc))
+                result.put((False, exc))
 
-        worker = threading.Thread(target=generate, name='JARVIS-call-brain', daemon=True)
+        worker = threading.Thread(target=transcribe, daemon=True,
+                                  name='JARVIS-call-transcription')
         worker.start()
-        started = time.monotonic()
-        filler_played = False
+        if self._filler_audio is not None:
+            self._stage = 'acknowledging user while transcribing'
+            self.say('Hmm, abhi dekhti hoon.', prepared=self._filler_audio)
+        deadline = time.monotonic() + 60
         while worker.is_alive():
             self.tick()
-            elapsed = time.monotonic() - started
-            if elapsed >= 30:
-                raise CallError('AI reply timed out; end call to retry safely.')
-            if (not filler_played and elapsed >= 1.35
-                    and self._filler_audio is not None):
-                filler_played = True
-                if worker.is_alive():
-                    self.say('Hmm Boss, ek second.', prepared=self._filler_audio)
+            if time.monotonic() > deadline:
+                raise CallError('Transcription timed out.')
             worker.join(.08)
-        ok, answer = results.get_nowait()
-        if not ok:
-            raise answer
-        self.tick()
-        self.say(answer or 'Boss, dobara bolo.')
+        success, value = result.get_nowait()
+        if not success:
+            raise value
+        return value
+
+    def think_and_say(self, text):
+        """One real answer per utterance; acknowledgement was already spoken."""
+        self._stage = 'generating reply'
+        reply = self.work(lambda: self.brain.reply(text), timeout=30)
+        self._stage = 'speaking reply'
+        self.say(reply or 'Boss, dobara bolo.')
 
     def run(self, identity_confirmed=False):
         if not self._exclusive.acquire(blocking=False):
@@ -655,10 +668,11 @@ class CallController:
             introduction = 'Hello boss! Main JARVIS hoon, aapka AI assistant. Batao, kya haal hai?'
             # Fail before calling if the key, credits, voice or TTS network is unavailable.
             self._intro_audio = self.render(introduction)
-            # Reuse this short WAV for delayed thoughts: never make the phone
-            # wait for Cartesia to synthesize an acknowledgement on the fly.
+            # Pre-render the acknowledgement before dialing. It will be
+            # played after incoming speech, during transcription, not after
+            # model thinking.
             try:
-                self._filler_audio = self.render('Hmm Boss, ek second.')
+                self._filler_audio = self.render('Hmm, abhi dekhti hoon.')
             except Exception:
                 self._filler_audio = None
             self.transition(State.DIALING)
@@ -698,27 +712,34 @@ class CallController:
                 self.tick()
                 self.transition(State.LISTENING)
                 self._stage = 'capturing remote WhatsApp speech'
-                # Hook the audio meter into the existing logger. Tests with
-                # older fake audio bridges remain compatible.
-                try:
-                    audio = self.audio.capture(self.stop, self.tick, report=self.status)
-                except TypeError as exc:
-                    if "report" not in str(exc):
-                        raise
-                    audio = self.audio.capture(self.stop, self.tick)
+                # IMPORTANT: drain PortAudio from another thread. Playwright
+                # DOM probes must stay on this owner thread, but can take much
+                # longer than the 20ms frame period. A dedicated capture
+                # thread prevents them silently dropping nearly all audio.
+                def capture_turn():
+                    try:
+                        return self.audio.capture(self.stop, lambda: None,
+                                                  report=self.status)
+                    except TypeError as exc:
+                        if 'report' not in str(exc):
+                            raise
+                        return self.audio.capture(self.stop, lambda: None)
+
+                audio = self.work(capture_turn, timeout=38)
                 if audio is None:
                     continue
-                self._stage = 'transcribing inbound speech'
-                self.status('Audio captured; transcribing.')
-                text = self.work(lambda: self.audio.transcribe(audio), timeout=60)
+                self.status('Audio captured; acknowledging and transcribing.')
+                text = self.transcribe_with_ack(audio)
                 if not text:
+                    self.status('Speech unclear; returning to listening.')
+                    self._stage = 'speech not recognized'
+                    self.say('Boss, awaaz clear nahi aayi. Dobara bologe?')
                     continue
                 if parse_command(text) == {'action': 'whatsapp_ai_end'}:
                     self.end()
                     break
                 self.status('HEARD: ' + spoken_text(text)[:110])
                 self.transition(State.THINKING)
-                self._stage = 'generating and playing reply'
                 self.think_and_say(text)
             return self.connected, 'Call ended.'
         except InterruptedError:
@@ -743,7 +764,10 @@ class CallController:
             if self.dialed:
                 try:
                     if not self.ui.hangup():
-                        self.status('No verified hangup control found; check WhatsApp if the call is still open.')
+                        if not getattr(self.ui, 'has_calls', True):
+                            self.status('Call UI already closed; no hangup action needed.')
+                        else:
+                            self.status('No verified hangup control found; check WhatsApp if the call is still open.')
                 except Exception:
                     self.status('Hangup could not be verified; check WhatsApp.')
             try:
