@@ -44,6 +44,7 @@ def normalize(text):
 def call_hangup_command(text):
     """Only full utterances; quoted mentions of a command must not hang up."""
     phrase = normalize(text)
+    phrase = re.sub(r"^please\s+|\s+please$", "", phrase).strip()
     return phrase in {
         "cut the call", "cut call", "call cut", "call cut karo",
         "call cut kar do", "call kaat do", "call kaat dena",
@@ -69,8 +70,8 @@ def classify(text):
              "what are your features", "what are your capabilities", "your features",
              "apne features batao", "tum kya kar sakti ho"}:
         return ("capabilities", "")
-    if (re.search(r"\b(?:what(?:s| is)? the time|what time is it|current time|time now)\b", t)
-            or re.search(r"\b(?:time batao|kitne baje|kitna time hua|abhi time kya|abhi kya time)\b", t)):
+    if (re.search(r"\b(?:what(?:s| is)? the time|what time is it|current time|exact time|time now)\b", t)
+            or re.search(r"\b(?:time batao|time bata do|kitne baje|kitna time hua|abhi time kya|abhi kya time)\b", t)):
         return ("time", "")
     if re.search(r"\b(?:today s date|todays date|what date is it|current date|aaj ki date|aaj ka din|what day is it)\b", t):
         return ("date", "")
@@ -79,9 +80,13 @@ def classify(text):
         topic = re.sub(r"\s+", " ", topic).strip()
         return ("news", (topic[:90] + " latest news") if topic else "India world latest news")
 
+    # Natural polite voice commands work as well as terse "Open Chrome".
+    open_text = re.sub(r"^(?:can you|could you|would you|zara|please)\s+",
+                       "", t).strip()
+    open_text = re.sub(r"\s+(?:please|now|zara)$", "", open_text).strip()
     # Only explicit named targets get privileged desktop operations.
-    prefix = re.fullmatch(OPEN_PREFIX + r"\s+(?:the\s+)?(.+?)(?:\s+app)?", t)
-    suffix = re.fullmatch(r"(.+?)\s+" + OPEN_SUFFIX, t)
+    prefix = re.fullmatch(OPEN_PREFIX + r"\s+(?:the\s+)?(.+?)(?:\s+app)?", open_text)
+    suffix = re.fullmatch(r"(.+?)\s+" + OPEN_SUFFIX, open_text)
     target = prefix.group(1).strip() if prefix else suffix.group(1).strip() if suffix else ""
     if target:
         target = re.sub(r"^(?:my|the)\s+", "", target)
