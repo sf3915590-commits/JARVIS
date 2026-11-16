@@ -1,0 +1,22 @@
+name: Test WhatsApp AI call routing
+
+on:
+  pull_request:
+    paths:
+      - "jarvis_whatsapp_ai_call.py"
+      - "test_jarvis_whatsapp_ai_call.py"
+      - ".github/workflows/test-whatsapp-ai-call.yml"
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate syntax without requiring Windows audio drivers
+        run: python -m py_compile jarvis_whatsapp_ai_call.py test_jarvis_whatsapp_ai_call.py
+      - name: Run isolated call tests
+        run: python -m unittest -v test_jarvis_whatsapp_ai_call.py
