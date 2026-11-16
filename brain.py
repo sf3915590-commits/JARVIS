@@ -1,16 +1,10 @@
 from pathlib import Path
 import re
-import time as _jarvis_perf_time
 import ollama
 import os
 import json
 import urllib.request
 import urllib.error
-import time
-try:
-    import psutil
-except ImportError:
-    psutil = None
 from security_policy import explicit_shutdown_command, parse_delete_request
 from memory_manager import (
     load_memory,
@@ -25,20 +19,8 @@ MODEL = "qwen3:4b-instruct"
 _selected_model = None
 _model_lock = __import__("threading").Lock()
 
-
-def _check_ram_throttle():
-    """Lightweight resource-throttle guard for RAM usage above 90%."""
-    if psutil is not None:
-        try:
-            mem = psutil.virtual_memory()
-            if mem.percent > 90.0:
-                print(f"[JARVIS RESOURCE WARNING] High RAM usage detected: {mem.percent}% (Available: {mem.available / (1024**2):.1f} MB). Throttling inference...", flush=True)
-                time.sleep(0.5)
-        except Exception:
-            pass
-
 # =====================================================
-# USER ROUTINE ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â persistent + query-only
+# USER ROUTINE â€” persistent + query-only
 # =====================================================
 
 ROUTINE_FACT = (
@@ -140,7 +122,7 @@ def _get_local_model():
                 str(item.get("model", item.get("name", ""))).lower()
                 for item in models
             }
-            for candidate in MODEL_CANDIDATES:
+            for candidate in MODEL_CANDIDATES: # pyright: ignore[reportUndefinedVariable]
                 if candidate.lower() in installed:
                     _selected_model = candidate
                     break
@@ -306,7 +288,7 @@ def get_language_instruction():
 
 
 # ============================================================
-# FAST LOCAL BRAIN Ã¢â‚¬â€ OpenVINO / Intel GPU
+# FAST LOCAL BRAIN — OpenVINO / Intel GPU
 # Existing Ollama remains the fallback.
 # ============================================================
 import threading as _ov_threading
@@ -322,16 +304,6 @@ def _load_openvino_brain():
     try:
         import openvino_genai as _ov_genai
         _OV_PIPELINE = _ov_genai.LLMPipeline(str(_OV_MODEL_DIR), "GPU")
-        # Warm up generation in the existing background loader.
-        try:
-            _OV_PIPELINE.generate(
-                "USER:\nReply with exactly: READY\n\nASSISTANT:\n",
-                max_new_tokens=4,
-                temperature=0.0,
-            )
-            print("FAST BRAIN: OpenVINO GPU warm-up complete", flush=True)
-        except Exception as _warm_error:
-            print(f"FAST BRAIN: OpenVINO warm-up skipped: {_warm_error}", flush=True)
         _OV_READY.set()
         print("FAST BRAIN: OpenVINO Intel GPU READY", flush=True)
     except Exception as _error:
@@ -345,130 +317,69 @@ def _start_openvino_brain():
 
 _start_openvino_brain()
 
-# JARVIS_PERFORMANCE_PATCH_V1
-# OpenVINO adapter: correct decoded-result extraction, Qwen3 no-think mode,
-# and precise provider/wait/generation timing. Ollama remains the fallback.
-def _clean_openvino_output(_result):
-    _text = ""
-    try:
-        if isinstance(_result, str):
-            _text = _result
-        elif isinstance(_result, dict):
-            _text = str(
-                _result.get("text")
-                or _result.get("generated_text")
-                or _result.get("content")
-                or ""
-            )
-        else:
-            _texts = getattr(_result, "texts", None)
-            if _texts is not None:
-                _texts = list(_texts)
-                _text = str(_texts[0]) if _texts else ""
-            else:
-                _text = str(_result or "")
-    except Exception as _extract_error:
-        print(f"JARVIS PERF: OpenVINO result extraction error: {_extract_error}", flush=True)
-        _text = ""
-
+def _clean_openvino_output(_text):
+    _text = str(_text or "")
     _text = re.sub(r"<think>.*?</think>", "", _text, flags=re.S | re.I)
     _text = re.sub(r"<think>.*", "", _text, flags=re.S | re.I)
     return _text.strip()
 
-
 def _fast_chat(*, model=None, messages=None, options=None, **_kwargs):
     global _OV_PIPELINE
 
-    _call_started = _jarvis_perf_time.perf_counter()
-    _wait_seconds = 0.0
-    _fallback_reason = ""
-
-    # Prepare a private copy so the Qwen3 no-thinking switch reaches both
-    # the OpenVINO primary path and the preserved Ollama fallback.
-    _chat_messages = []
-    for _message in (messages or []):
-        _copy = dict(_message)
-        if str(_copy.get("role", "")).lower() == "system":
-            _system_content = str(_copy.get("content", ""))
-            if "/no_think" not in _system_content:
-                _copy["content"] = _system_content.rstrip() + "\n/no_think"
-        _chat_messages.append(_copy)
-
     if _OV_PIPELINE is None and _OV_LOAD_ERROR is None:
-        _wait_started = _jarvis_perf_time.perf_counter()
-        _OV_READY.wait(timeout=45)
-        _wait_seconds = _jarvis_perf_time.perf_counter() - _wait_started
+        _OV_READY.wait(timeout=2)
 
-    if _OV_PIPELINE is not None:
+    _opts = options or {}
+    try:
+        _requested_tokens = int(_opts.get("num_predict", 80))
+    except (TypeError, ValueError):
+        _requested_tokens = 80
+
+    # OpenVINO's current fast path is capped at 120 tokens. Longer workspace
+    # replies must use Ollama so code and detailed answers are not cut off.
+    if _OV_PIPELINE is not None and _requested_tokens <= 120:
         try:
             _parts = []
-            for _m in _chat_messages:
+            for _m in (messages or []):
                 _role = str(_m.get("role", "user")).upper()
                 _content = str(_m.get("content", ""))
                 _parts.append(f"{_role}:\n{_content}")
             _prompt = "\n\n".join(_parts) + "\n\nASSISTANT:\n"
 
-            _opts = options or {}
-            _max_tokens = int(_opts.get("num_predict", 30))
-            _max_tokens = max(16, min(_max_tokens, 120))
-            _temperature = float(_opts.get("temperature", 0.2))
-
-            _generation_started = _jarvis_perf_time.perf_counter()
+            _max_tokens = max(16, min(_requested_tokens, 120))
             _out = _OV_PIPELINE.generate(
                 _prompt,
                 max_new_tokens=_max_tokens,
-                temperature=_temperature,
+                temperature=float(_opts.get("temperature", 0.2)),
             )
-            _generation_seconds = _jarvis_perf_time.perf_counter() - _generation_started
             _answer = _clean_openvino_output(_out)
             if _answer:
-                _total = _jarvis_perf_time.perf_counter() - _call_started
-                print(
-                    "JARVIS PERF | provider=OpenVINO-GPU"
-                    f" | ready_wait={_wait_seconds:.2f}s"
-                    f" | generation={_generation_seconds:.2f}s"
-                    f" | total={_total:.2f}s"
-                    f" | prompt_chars={len(_prompt)}"
-                    f" | output_chars={len(_answer)}",
-                    flush=True,
-                )
-                return {"message": {"content": _answer}}
-
-            _fallback_reason = "OpenVINO returned empty decoded text"
+                return {
+                    "message": {
+                        "content": _answer
+                    }
+                }
         except Exception as _error:
-            _fallback_reason = f"OpenVINO exception: {_type_name(_error)}: {_error}"
-            print(f"JARVIS PERF: {_fallback_reason}", flush=True)
-    elif _OV_LOAD_ERROR is not None:
-        _fallback_reason = f"OpenVINO loader failed: {_OV_LOAD_ERROR}"
-    else:
-        _fallback_reason = "OpenVINO was not ready within 45 seconds"
+            print(f"FAST BRAIN GPU ERROR — using Ollama fallback: {_error}", flush=True)
 
     import ollama as _ollama
-    _ollama_started = _jarvis_perf_time.perf_counter()
-    _result = _ollama.chat(model=model, messages=_chat_messages, options=options, **_kwargs)
-    _ollama_seconds = _jarvis_perf_time.perf_counter() - _ollama_started
-    _total = _jarvis_perf_time.perf_counter() - _call_started
-    print(
-        "JARVIS PERF | provider=Ollama-fallback"
-        f" | reason={_fallback_reason}"
-        f" | ready_wait={_wait_seconds:.2f}s"
-        f" | ollama={_ollama_seconds:.2f}s"
-        f" | total={_total:.2f}s",
-        flush=True,
-    )
-    return _result
+    return _ollama.chat(model=model, messages=messages, options=options, **_kwargs)
 
 
-def _type_name(_value):
-    return type(_value).__name__
-
-
-def ask_ai(text):
+def ask_ai(text, response_tokens=30):
        
 
     """JARVIS local AI response layer using Ollama/Qwen."""
-
-    _ask_started = _jarvis_perf_time.perf_counter()
+    try:
+        response_tokens = int(response_tokens)
+    except (TypeError, ValueError):
+        response_tokens = 30
+    response_tokens = max(30, min(response_tokens, 1400))
+    reply_guidance = (
+        "Normal replies should be 1-4 sentences and spoken-friendly."
+        if response_tokens <= 30 else
+        "For Chat Workspace requests, provide the complete requested material or code; follow the requested format and do not stop at a short spoken reply."
+    )
 
     selected_language = set_reply_language(text)
 
@@ -496,9 +407,7 @@ def ask_ai(text):
         )
 
     try:
-        _memory_started = _jarvis_perf_time.perf_counter()
         memory_context = get_memory_context()
-        print(f"JARVIS PERF | memory_context={_jarvis_perf_time.perf_counter() - _memory_started:.2f}s", flush=True)
 
         system_prompt = f"""
 You are JARVIS, a polished personal desktop AI assistant.
@@ -507,7 +416,7 @@ STYLE:
 - Sound calm, confident, natural and human.
 - Address the user as Boss only when it feels natural; do not overuse it.
 - Answer the exact question first. Do not invent intent.
-- When Hindi/Urdu speech is transcribed into Devanagari or Urdu script, interpret phonetic renderings of English technical terms by context and sound. For example, "ÃƒÂ Ã‚Â¤Ã‚ÂªÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¤Ã‚Â¨", "ÃƒÂ Ã‚Â¤Ã‚ÂªÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¤Ã‚Â¥ÃƒÂ Ã‚Â¤Ã‚Â¨", or "ÃƒÂ Ã‚Â¤Ã‚ÂªÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¤Ã‚Â¨" can mean "Python"; "ÃƒÂ Ã‚Â¤Ã‚ÂµÃƒÂ Ã‚Â¥Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¤Ã‚Â°ÃƒÂ Ã‚Â¤Ã‚Â¿ÃƒÂ Ã‚Â¤Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¬ÃƒÂ Ã‚Â¤Ã‚Â²ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¸" can mean "variables". Do not treat these as literal spelling mistakes when the surrounding sentence clearly identifies the technical term.
+- When Hindi/Urdu speech is transcribed into Devanagari or Urdu script, interpret phonetic renderings of English technical terms by context and sound. For example, "à¤ªà¤¾à¤‡à¤Ÿà¤¨", "à¤ªà¤¾à¤‡à¤¥à¤¨", or "à¤ªà¤¾à¤‡à¤Ÿà¤¨" can mean "Python"; "à¤µà¥‡à¤°à¤¿à¤à¤¬à¤²à¥à¤¸" can mean "variables". Do not treat these as literal spelling mistakes when the surrounding sentence clearly identifies the technical term.
 - Follow the selected JARVIS reply language exactly.
 - DEFAULT: Roman Urdu/Hinglish.
 - SELECTED LANGUAGE: {get_language_instruction()}
@@ -515,7 +424,7 @@ STYLE:
 - Keep the selected language consistent throughout the response.
 - Never give robotic filler.
 - Do not repeat the user's question.
-- Normal replies should be 1-4 sentences and spoken-friendly.
+- {reply_guidance}
 - Do not use emojis in spoken answers.
 - For simple questions, answer immediately and briefly.
 - For technical questions, give the practical answer first.
@@ -537,7 +446,7 @@ MEMORY:
             keep_alive="30m",
             options={
                 "temperature": 0.2,
-                "num_predict": 180,
+                "num_predict": response_tokens,
                 "num_ctx": 2048,
             },
         )
@@ -551,7 +460,6 @@ MEMORY:
         if not response:
             return "Boss, ek second. Dobara bolna."
 
-        print(f"JARVIS PERF | ask_ai_total={_jarvis_perf_time.perf_counter() - _ask_started:.2f}s", flush=True)
         return response
 
     except Exception as e:
@@ -709,188 +617,6 @@ def understand(text):
         flags=re.IGNORECASE,
     ).strip()
 
-    # Use the cleaned wake-word-free command for every deterministic router below.
-    c = command.rstrip(' .!?,;:').strip()
-
-    # Normalize compact voice STT forms like OpenYoutube -> Open YouTube
-    c = re.sub(r'(?i)\b(open|launch)(youtube|google|chrome|chatgpt|whatsapp|vscode|instagram)\b', r'\1 \2', c)
-
-
-    # ============================================================
-    # JARVIS PURE STUDY MODE
-    # Dedicated study router. Existing normal chat remains untouched.
-    # ============================================================
-    study_commands = {
-        "study mode",
-        "study mode on",
-        "pure study mode",
-        "pure study mode on",
-        "start study mode",
-        "start pure study mode",
-        "study start",
-        "study mode start",
-    }
-
-    if c in study_commands:
-        return {
-            "action": "study_mode",
-            "mode": "start",
-        }
-
-    if c in {
-        "study mode off",
-        "pure study mode off",
-        "stop study mode",
-        "exit study mode",
-        "study stop",
-    }:
-        return {
-            "action": "study_mode",
-            "mode": "stop",
-        }
-
-    if c in {
-        "study status",
-        "study progress",
-        "my study progress",
-        "study revision",
-        "study weak topics",
-    }:
-        return {
-            "action": "study_mode",
-            "mode": "status",
-        }
-
-    # Explicit study requests are sent through the existing local AI brain
-    # with the dedicated professor instructions. No second AI is created.
-    study_prefixes = (
-        "study teach ",
-        "study explain ",
-        "study learn ",
-        "study quiz ",
-        "study test ",
-        "study mock test ",
-        "study revise ",
-        "study solve ",
-    )
-
-    for prefix in study_prefixes:
-        if c.startswith(prefix):
-            return {
-                "action": "study_request",
-                "mode": prefix.strip(),
-                "target": c[len(prefix):].strip(),
-            }
-
-    # ============================================================
-    # SCREEN / GUI CONTROL
-    # Screen-aware actions use screen_agent.py.
-    # ============================================================
-
-    if c in {
-        "see my screen",
-        "see the screen",
-        "show my screen",
-        "show me my screen",
-        "look at my screen",
-        "look at the screen",
-        "check my screen",
-        "check the screen",
-        "screen dekho",
-        "mera screen dekho",
-        "screen dikhao",
-        "screen check karo",
-        "take a screenshot",
-        "take screenshot",
-        "screenshot lo",
-        "screenshot le lo",
-    }:
-        return {
-            "action": "screen_control",
-            "mode": "screenshot",
-        }
-
-    if c in {
-        "click allow",
-        "allow click karo",
-        "allow pe click karo",
-        "allow click kar do",
-        "allow ko click karo",
-        "click on allow",
-    }:
-        return {
-            "action": "screen_control",
-            "mode": "click_text",
-            "target": "Allow",
-        }
-
-    if c in {
-        "scroll down",
-        "scroll neeche",
-        "neeche scroll karo",
-        "scroll up",
-        "scroll upar",
-        "upar scroll karo",
-    }:
-        amount = -5 if ("down" in c or "neeche" in c) else 5
-        return {
-            "action": "screen_control",
-            "mode": "scroll",
-            "amount": amount,
-        }
-
-    # ============================================================
-    # WINDOWS VOLUME FAST PATH
-    # ============================================================
-    if c in {
-        "volume up",
-        "increase volume",
-        "increase the volume",
-        "louder",
-        "make it louder",
-        "volume badhao",
-        "awaz badhao",
-        "awaaz badhao",
-        "sound badhao",
-    }:
-        return {"action": "volume_up"}
-
-    if c in {
-        "volume down",
-        "decrease volume",
-        "decrease the volume",
-        "lower volume",
-        "make it quieter",
-        "volume kam",
-        "volume kam karo",
-        "awaz kam karo",
-        "awaaz kam karo",
-        "sound kam karo",
-    }:
-        return {"action": "volume_down"}
-
-    if c in {
-        "mute",
-        "mute volume",
-        "mute sound",
-        "sound mute",
-        "volume mute",
-        "awaz mute",
-        "awaaz mute",
-    }:
-        return {"action": "volume_mute"}
-
-    if c in {
-        "unmute",
-        "unmute volume",
-        "unmute sound",
-        "sound unmute",
-        "volume unmute",
-        "awaz unmute",
-        "awaaz unmute",
-    }:
-        return {"action": "volume_unmute"}
-
     # =====================================================
     # REMEMBER SOMETHING
     # =====================================================
@@ -1022,14 +748,36 @@ def understand(text):
     # WHATSAPP MESSAGE
     # =====================================================
 
-# JARVIS_PRIORITY_WHATSAPP_ROUTER_V1
-    try:
-        from jarvis_whatsapp_controls import parse_command as _jarvis_parse_whatsapp_control
-        _jarvis_whatsapp_action = _jarvis_parse_whatsapp_control(original)
-        if _jarvis_whatsapp_action:
-            return _jarvis_whatsapp_action
-    except Exception as _jarvis_whatsapp_route_error:
-        print(f"[JARVIS WHATSAPP ROUTER] {type(_jarvis_whatsapp_route_error).__name__}", flush=True)
+    # JARVIS_LOCAL_WHATSAPP_CALL_ROUTER_V4
+    _wa_text = re.sub(r"\s+", " ", original.strip())
+    _wa_text = _wa_text.strip(" .,!?'\\\"")
+    _wa_text = re.sub(r"^(?:hey\s+)?jarvis[,\s]+", "", _wa_text, flags=re.I)
+
+    _wa_call = re.fullmatch(
+        r"(?:(?:whatsapp|watsapp|watsap)\s+)?"
+        r"(?:(?:voice|video)\s+)?"
+        r"call(?:ed)?\s+(.+)",
+        _wa_text,
+        flags=re.I,
+    )
+    if _wa_call:
+        _target = _wa_call.group(1).strip()
+        _target = re.sub(
+            r"^(?:(?:whatsapp|watsapp|watsap)\s+)?"
+            r"(?:(?:voice|video)\s+)?call\s+",
+            "", _target, flags=re.I,
+        )
+        _target = re.sub(
+            r"\s+on\s+(?:whatsapp|watsapp|watsap)$",
+            "", _target, flags=re.I,
+        )
+        _target = _target.strip(" .,!?'\\\"")
+        if _target:
+            return {
+                "action": "whatsapp_call",
+                "target": _target,
+                "video": bool(re.search(r"\bvideo\s+call\b", _wa_text, re.I)),
+            }
 
     whatsapp_result = _extract_whatsapp(original)
     if whatsapp_result:
@@ -1039,74 +787,6 @@ def understand(text):
     # COMPUTER CONTROL
     # =====================================================
 
-    # Screen power
-    command = command.rstrip(' .!?,;:').strip()
-    if command in [
-        "screen off","screening off","screening off kar do","screening my screen off","turn off my screen",
-        "turn off screen",
-        "turn off my screen",
-        "turn my screen off",
-        "display off",
-        "monitor off",
-        "screen band",
-        "screen bandh",
-        "display band",
-        "monitor band",
-    ]:
-        return {"action": "screen_off"}
-
-    if command in [
-        "screen on","screening on","screening on kar do","screening my screen on","turn on my screen",
-        "turn on screen",
-        "turn on my screen",
-        "turn my screen on",
-        "display on",
-        "monitor on",
-        "screen chalu",
-        "display chalu",
-        "monitor chalu",
-    ]:
-        return {"action": "screen_on"}
-    # Screen power
-    command = command.rstrip(' .!?,;:').strip()
-    if command in [
-        "screen off","screening off","screening off kar do","screening my screen off","turn off my screen",
-        "turn off screen",
-        "turn off my screen",
-        "turn my screen off",
-        "display off",
-        "monitor off",
-        "screen band",
-        "screen bandh",
-        "display band",
-        "monitor band",
-    ]:
-        return {"action": "screen_off"}
-
-    if command in [
-        "screen on","screening on","screening on kar do","screening my screen on","turn on my screen",
-        "turn on screen",
-        "turn on my screen",
-        "turn my screen on",
-        "display on",
-        "monitor on",
-        "screen chalu",
-        "display chalu",
-        "monitor chalu",
-    ]:
-        return {"action": "screen_on"}
-    # Screen ON/OFF
-    if command in [
-        "turn on screen", "turn on my screen", "screen on","screening on","screening on kar do","screening my screen on","turn on my screen",
-        "screen chalu karo", "screen on kar do", "monitor on", "display on"
-    ]:
-        return {"action": "screen_on"}
-
-    if command in [
-        "turn off screen", "turn off my screen", "screen off","screening off","screening off kar do","screening my screen off","turn off my screen",
-        "screen band karo", "screen band kar do", "monitor off", "display off"
-    ]:
-        return {"action": "screen_off"}
     # Screenshot
     if command in [
         "take screenshot",
@@ -1194,7 +874,7 @@ def understand(text):
             query = extract_youtube_query(original)
 
             if query:
-                print(f"ÃƒÂ¢Ã¢â‚¬â€œÃ‚Â¶ÃƒÂ¯Ã‚Â¸Ã‚Â YouTube command detected: {query}")
+                print(f"â–¶ï¸ YouTube command detected: {query}")
 
                 return {
                     "action": "youtube",
@@ -1262,7 +942,7 @@ def understand(text):
         any(x in c for x in site_words)
         and any(x in c for x in task_words)
     ):
-        print("ÃƒÂ°Ã…Â¸Ã¢â‚¬â„¢Ã‚Â» Website coding task detected.")
+        print("ðŸ’» Website coding task detected.")
 
         return {
             "action": "build_website",
@@ -1292,48 +972,12 @@ def understand(text):
             prompt = c.split(trigger, 1)[1].strip()
 
             if prompt:
-                print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¨ Image generation task detected: {prompt}", flush=True)
+                print(f"ðŸŽ¨ Image generation task detected: {prompt}", flush=True)
                 return {
                     "action": "generate_image",
                     "target": prompt,
                 }
 
-
-    # =====================================================
-    # IMAGE GENERATION CONFIRMATION / FOLLOW-UP
-    # =====================================================
-
-    image_confirmations = {
-        "haan", "han", "yes", "yeah", "yep", "ok", "okay",
-        "haan kar do", "han kar do", "yes do it", "yes generate it",
-        "generate it", "make it", "create it", "kar do", "bana do"
-    }
-
-    if c in image_confirmations:
-        try:
-            _memory = load_memory()
-            _conversations = _memory.get("conversations", [])
-
-            for _item in reversed(_conversations):
-                _previous_user = str(_item.get("user", "")).strip()
-
-                if any(_trigger in _previous_user.lower() for _trigger in image_triggers):
-                    _prompt = _previous_user
-
-                    for _trigger in image_triggers:
-                        if _trigger in _prompt.lower():
-                            _prompt = _prompt.lower().split(_trigger, 1)[1].strip()
-                            break
-
-                    if _prompt:
-                        print(f"Image confirmation detected: {_prompt}", flush=True)
-                        return {
-                            "action": "generate_image",
-                            "target": _prompt,
-                        }
-
-        except Exception as _e:
-            print(f"Image confirmation context error: {_e}", flush=True)
 
     # =====================================================
     # APPS
@@ -1406,41 +1050,41 @@ def understand(text):
         "open", "launch", "start", "run", "chalao", "chalu karo",
         "khol", "kholo", "khol do", "open karo", "open kar",
         # Hindi / Urdu
-        "ÃƒÂ Ã‚Â¤Ã¢â‚¬â€œÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã‚Â²ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹", "ÃƒÂ Ã‚Â¤Ã¢â‚¬â€œÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã‚Â²", "ÃƒÂ Ã‚Â¤Ã¢â‚¬â€œÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã‚Â² ÃƒÂ Ã‚Â¤Ã‚Â¦ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹", "ÃƒÂ Ã‚Â¤Ã…Â¡ÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã‚Â²ÃƒÂ Ã‚Â¥Ã¢â‚¬Å¡ ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¤Ã‚Â°ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹", "ÃƒÂ Ã‚Â¤Ã‚Â¶ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â°ÃƒÂ Ã‚Â¥Ã¢â‚¬Å¡ ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¤Ã‚Â°ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹", "ÃƒÂ Ã‚Â¤Ã…Â¡ÃƒÂ Ã‚Â¤Ã‚Â²ÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã¢â‚¬Å“",
-        "ÃƒÅ¡Ã‚Â©ÃƒÅ¡Ã‚Â¾Ãƒâ„¢Ã‹â€ Ãƒâ„¢Ã¢â‚¬Å¾Ãƒâ„¢Ã‹â€ ", "ÃƒÅ¡Ã‚Â©ÃƒÅ¡Ã‚Â¾Ãƒâ„¢Ã‹â€ Ãƒâ„¢Ã¢â‚¬Å¾", "ÃƒÅ¡Ã‚Â©ÃƒÅ¡Ã‚Â¾Ãƒâ„¢Ã‹â€ Ãƒâ„¢Ã¢â‚¬Å¾ ÃƒËœÃ‚Â¯Ãƒâ„¢Ã‹â€ ", "ÃƒÅ¡Ã¢â‚¬Â ÃƒËœÃ‚Â§Ãƒâ„¢Ã¢â‚¬Å¾Ãƒâ„¢Ã‹â€  ÃƒÅ¡Ã‚Â©ÃƒËœÃ‚Â±Ãƒâ„¢Ã‹â€ ", "ÃƒËœÃ‚Â´ÃƒËœÃ‚Â±Ãƒâ„¢Ã‹â€ ÃƒËœÃ‚Â¹ ÃƒÅ¡Ã‚Â©ÃƒËœÃ‚Â±Ãƒâ„¢Ã‹â€ ",
+        "à¤–à¥‹à¤²à¥‹", "à¤–à¥‹à¤²", "à¤–à¥‹à¤² à¤¦à¥‹", "à¤šà¤¾à¤²à¥‚ à¤•à¤°à¥‹", "à¤¶à¥à¤°à¥‚ à¤•à¤°à¥‹", "à¤šà¤²à¤¾à¤“",
+        "Ú©Ú¾ÙˆÙ„Ùˆ", "Ú©Ú¾ÙˆÙ„", "Ú©Ú¾ÙˆÙ„ Ø¯Ùˆ", "Ú†Ø§Ù„Ùˆ Ú©Ø±Ùˆ", "Ø´Ø±ÙˆØ¹ Ú©Ø±Ùˆ",
         # Bengali
-        "ÃƒÂ Ã‚Â¦Ã¢â‚¬â€œÃƒÂ Ã‚Â§Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â§Ã¢â‚¬Â¹", "ÃƒÂ Ã‚Â¦Ã¢â‚¬â€œÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â¨", "ÃƒÂ Ã‚Â¦Ã¢â‚¬â€œÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â§Ã¢â‚¬Â¡ ÃƒÂ Ã‚Â¦Ã‚Â¦ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã¢â‚¬Å“", "ÃƒÂ Ã‚Â¦Ã…Â¡ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â§Ã‚Â ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¦Ã‚Â°ÃƒÂ Ã‚Â§Ã¢â‚¬Â¹", "ÃƒÂ Ã‚Â¦Ã‚Â¶ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â°ÃƒÂ Ã‚Â§Ã‚Â ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¦Ã‚Â°ÃƒÂ Ã‚Â§Ã¢â‚¬Â¹",
+        "à¦–à§‹à¦²à§‹", "à¦–à§à¦²à§à¦¨", "à¦–à§à¦²à§‡ à¦¦à¦¾à¦“", "à¦šà¦¾à¦²à§ à¦•à¦°à§‹", "à¦¶à§à¦°à§ à¦•à¦°à§‹",
         # Telugu
-        "ÃƒÂ Ã‚Â°Ã‚Â¤ÃƒÂ Ã‚Â±Ã¢â‚¬Â ÃƒÂ Ã‚Â°Ã‚Â°ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚ÂµÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â°Ã‚Â¤ÃƒÂ Ã‚Â±Ã¢â‚¬Â ÃƒÂ Ã‚Â°Ã‚Â°ÃƒÂ Ã‚Â°Ã‚ÂµÃƒÂ Ã‚Â°Ã¢â‚¬Å¡ÃƒÂ Ã‚Â°Ã‚Â¡ÃƒÂ Ã‚Â°Ã‚Â¿", "ÃƒÂ Ã‚Â°Ã¢â‚¬Å“ÃƒÂ Ã‚Â°Ã‚ÂªÃƒÂ Ã‚Â±Ã¢â‚¬Â ÃƒÂ Ã‚Â°Ã‚Â¨ÃƒÂ Ã‚Â±Ã‚Â ÃƒÂ Ã‚Â°Ã…Â¡ÃƒÂ Ã‚Â±Ã¢â‚¬Â¡ÃƒÂ Ã‚Â°Ã‚Â¯ÃƒÂ Ã‚Â°Ã‚Â¿", "ÃƒÂ Ã‚Â°Ã‚Â¤ÃƒÂ Ã‚Â±Ã¢â‚¬Â ÃƒÂ Ã‚Â°Ã‚Â°ÃƒÂ Ã‚Â°Ã‚Â¿ÃƒÂ Ã‚Â°Ã…Â¡ÃƒÂ Ã‚Â°Ã‚Â¿ ÃƒÂ Ã‚Â°Ã‚ÂªÃƒÂ Ã‚Â±Ã¢â‚¬Â ÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â°Ã‚ÂªÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚Â°ÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã‚Â°ÃƒÂ Ã‚Â°Ã¢â‚¬Å¡ÃƒÂ Ã‚Â°Ã‚Â­ÃƒÂ Ã‚Â°Ã‚Â¿ÃƒÂ Ã‚Â°Ã¢â‚¬Å¡ÃƒÂ Ã‚Â°Ã…Â¡ÃƒÂ Ã‚Â±Ã‚Â",
+        "à°¤à±†à°°à±à°µà±", "à°¤à±†à°°à°µà°‚à°¡à°¿", "à°“à°ªà±†à°¨à± à°šà±‡à°¯à°¿", "à°¤à±†à°°à°¿à°šà°¿ à°ªà±†à°Ÿà±à°Ÿà±", "à°ªà±à°°à°¾à°°à°‚à°­à°¿à°‚à°šà±",
         # Marathi
-        "ÃƒÂ Ã‚Â¤Ã¢â‚¬Â°ÃƒÂ Ã‚Â¤Ã‹Å“ÃƒÂ Ã‚Â¤Ã‚Â¡", "ÃƒÂ Ã‚Â¤Ã¢â‚¬Â°ÃƒÂ Ã‚Â¤Ã‹Å“ÃƒÂ Ã‚Â¤Ã‚Â¡ÃƒÂ Ã‚Â¤Ã‚Â¾", "ÃƒÂ Ã‚Â¤Ã¢â‚¬Â°ÃƒÂ Ã‚Â¤Ã‹Å“ÃƒÂ Ã‚Â¤Ã‚Â¡ÃƒÂ Ã‚Â¥Ã¢â‚¬Å¡ÃƒÂ Ã‚Â¤Ã‚Â¨ ÃƒÂ Ã‚Â¤Ã‚Â¦ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¡", "ÃƒÂ Ã‚Â¤Ã‚Â¸ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â°ÃƒÂ Ã‚Â¥Ã¢â‚¬Å¡ ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¤Ã‚Â°", "ÃƒÂ Ã‚Â¤Ã…Â¡ÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã‚Â²ÃƒÂ Ã‚Â¥Ã¢â‚¬Å¡ ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¤Ã‚Â°",
+        "à¤‰à¤˜à¤¡", "à¤‰à¤˜à¤¡à¤¾", "à¤‰à¤˜à¤¡à¥‚à¤¨ à¤¦à¥‡", "à¤¸à¥à¤°à¥‚ à¤•à¤°", "à¤šà¤¾à¤²à¥‚ à¤•à¤°",
         # Tamil
-        "ÃƒÂ Ã‚Â®Ã‚Â¤ÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã‚Â±", "ÃƒÂ Ã‚Â®Ã‚Â¤ÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã‚Â±ÃƒÂ Ã‚Â®Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã¢â‚¬Â¢ÃƒÂ Ã‚Â®Ã‚ÂµÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã‚Â®ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â®Ã‚Â¤ÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã‚Â±ÃƒÂ Ã‚Â®Ã‚Â¨ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã‚Â¤ÃƒÂ Ã‚Â¯Ã‚Â ÃƒÂ Ã‚Â®Ã‚ÂµÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â®Ã‚Â¤ÃƒÂ Ã‚Â¯Ã…Â ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â®Ã¢â€žÂ¢ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â®Ã¢â‚¬Â ÃƒÂ Ã‚Â®Ã‚Â°ÃƒÂ Ã‚Â®Ã‚Â®ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã‚ÂªÃƒÂ Ã‚Â®Ã‚Â¿",
+        "à®¤à®¿à®±", "à®¤à®¿à®±à®•à¯à®•à®µà¯à®®à¯", "à®¤à®¿à®±à®¨à¯à®¤à¯ à®µà®¿à®Ÿà¯", "à®¤à¯Šà®Ÿà®™à¯à®•à¯", "à®†à®°à®®à¯à®ªà®¿",
         # Gujarati
-        "ÃƒÂ Ã‚ÂªÃ¢â‚¬â€œÃƒÂ Ã‚Â«Ã¢â‚¬Â¹ÃƒÂ Ã‚ÂªÃ‚Â²ÃƒÂ Ã‚Â«Ã¢â‚¬Â¹", "ÃƒÂ Ã‚ÂªÃ¢â‚¬â€œÃƒÂ Ã‚Â«Ã¢â‚¬Â¹ÃƒÂ Ã‚ÂªÃ‚Â²", "ÃƒÂ Ã‚ÂªÃ¢â‚¬â€œÃƒÂ Ã‚Â«Ã¢â‚¬Â¹ÃƒÂ Ã‚ÂªÃ‚Â²ÃƒÂ Ã‚Â«Ã¢â€šÂ¬ ÃƒÂ Ã‚ÂªÃ‚Â¦ÃƒÂ Ã‚Â«Ã¢â‚¬Â¹", "ÃƒÂ Ã‚ÂªÃ…Â¡ÃƒÂ Ã‚ÂªÃ‚Â¾ÃƒÂ Ã‚ÂªÃ‚Â²ÃƒÂ Ã‚Â«Ã‚Â ÃƒÂ Ã‚ÂªÃ¢â‚¬Â¢ÃƒÂ Ã‚ÂªÃ‚Â°ÃƒÂ Ã‚Â«Ã¢â‚¬Â¹", "ÃƒÂ Ã‚ÂªÃ‚Â¶ÃƒÂ Ã‚ÂªÃ‚Â°ÃƒÂ Ã‚Â«Ã¢â‚¬Å¡ ÃƒÂ Ã‚ÂªÃ¢â‚¬Â¢ÃƒÂ Ã‚ÂªÃ‚Â°ÃƒÂ Ã‚Â«Ã¢â‚¬Â¹",
+        "àª–à«‹àª²à«‹", "àª–à«‹àª²", "àª–à«‹àª²à«€ àª¦à«‹", "àªšàª¾àª²à« àª•àª°à«‹", "àª¶àª°à«‚ àª•àª°à«‹",
         # Kannada
-        "ÃƒÂ Ã‚Â²Ã‚Â¤ÃƒÂ Ã‚Â³Ã¢â‚¬Â ÃƒÂ Ã‚Â²Ã‚Â°ÃƒÂ Ã‚Â³Ã¢â‚¬Â ", "ÃƒÂ Ã‚Â²Ã‚Â¤ÃƒÂ Ã‚Â³Ã¢â‚¬Â ÃƒÂ Ã‚Â²Ã‚Â°ÃƒÂ Ã‚Â³Ã¢â‚¬Â ÃƒÂ Ã‚Â²Ã‚Â¯ÃƒÂ Ã‚Â²Ã‚Â¿ÃƒÂ Ã‚Â²Ã‚Â°ÃƒÂ Ã‚Â²Ã‚Â¿", "ÃƒÂ Ã‚Â²Ã‚Â¤ÃƒÂ Ã‚Â³Ã¢â‚¬Â ÃƒÂ Ã‚Â²Ã‚Â°ÃƒÂ Ã‚Â³Ã¢â‚¬Â ÃƒÂ Ã‚Â²Ã‚Â¦ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã‚Â¬ÃƒÂ Ã‚Â²Ã‚Â¿ÃƒÂ Ã‚Â²Ã‚Â¡ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚Â²Ã…Â¡ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã‚Â²ÃƒÂ Ã‚Â³Ã¢â‚¬Å¡ ÃƒÂ Ã‚Â²Ã‚Â®ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã‚Â¡ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚Â²Ã‚ÂªÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã‚Â°ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã‚Â°ÃƒÂ Ã‚Â²Ã¢â‚¬Å¡ÃƒÂ Ã‚Â²Ã‚Â­ÃƒÂ Ã‚Â²Ã‚Â¿ÃƒÂ Ã‚Â²Ã‚Â¸ÃƒÂ Ã‚Â³Ã‚Â",
+        "à²¤à³†à²°à³†", "à²¤à³†à²°à³†à²¯à²¿à²°à²¿", "à²¤à³†à²°à³†à²¦à³à²¬à²¿à²¡à³", "à²šà²¾à²²à³‚ à²®à²¾à²¡à³", "à²ªà³à²°à²¾à²°à²‚à²­à²¿à²¸à³",
         # Malayalam
-        "ÃƒÂ Ã‚Â´Ã‚Â¤ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚ÂµÃ¢â‚¬Å¡", "ÃƒÂ Ã‚Â´Ã‚Â¤ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã¢â‚¬Â¢", "ÃƒÂ Ã‚Â´Ã‚Â¤ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚Â´Ã‚Â¨ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â¨ÃƒÂ Ã‚ÂµÃ‚Â ÃƒÂ Ã‚Â´Ã‚Â¤ÃƒÂ Ã‚Â´Ã‚Â°ÃƒÂ Ã‚ÂµÃ¢â‚¬Å¡", "ÃƒÂ Ã‚Â´Ã¢â‚¬Å“ÃƒÂ Ã‚Â´Ã‚ÂªÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚ÂªÃƒÂ Ã‚ÂµÃ‚Âº ÃƒÂ Ã‚Â´Ã…Â¡ÃƒÂ Ã‚ÂµÃ¢â‚¬Â ÃƒÂ Ã‚Â´Ã‚Â¯ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â¯ÃƒÂ Ã‚ÂµÃ¢â‚¬Å¡", "ÃƒÂ Ã‚Â´Ã‚Â¤ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã…Â¸ÃƒÂ Ã‚Â´Ã¢â€žÂ¢ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã¢â€žÂ¢ÃƒÂ Ã‚ÂµÃ¢â‚¬Å¡",
+        "à´¤àµà´±à´•àµà´•àµ‚", "à´¤àµà´±à´•àµà´•àµà´•", "à´¤àµà´±à´¨àµà´¨àµ à´¤à´°àµ‚", "à´“à´ªàµà´ªàµº à´šàµ†à´¯àµà´¯àµ‚", "à´¤àµà´Ÿà´™àµà´™àµ‚",
         # Punjabi
-        "ÃƒÂ Ã‚Â¨Ã¢â‚¬â€œÃƒÂ Ã‚Â©Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¨Ã‚Â²ÃƒÂ Ã‚Â©Ã‚ÂÃƒÂ Ã‚Â¨Ã‚Â¹ÃƒÂ Ã‚Â©Ã¢â‚¬Â¹", "ÃƒÂ Ã‚Â¨Ã¢â‚¬â€œÃƒÂ Ã‚Â©Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¨Ã‚Â²ÃƒÂ Ã‚Â©Ã‚ÂÃƒÂ Ã‚Â¨Ã‚Â¹", "ÃƒÂ Ã‚Â¨Ã¢â‚¬â€œÃƒÂ Ã‚Â©Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¨Ã‚Â²ÃƒÂ Ã‚Â©Ã‚ÂÃƒÂ Ã‚Â¨Ã‚Â¹ ÃƒÂ Ã‚Â¨Ã‚Â¦ÃƒÂ Ã‚Â¨Ã‚Â¿ÃƒÂ Ã‚Â¨Ã¢â‚¬Å“", "ÃƒÂ Ã‚Â¨Ã…Â¡ÃƒÂ Ã‚Â¨Ã‚Â¾ÃƒÂ Ã‚Â¨Ã‚Â²ÃƒÂ Ã‚Â©Ã¢â‚¬Å¡ ÃƒÂ Ã‚Â¨Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¨Ã‚Â°ÃƒÂ Ã‚Â©Ã¢â‚¬Â¹", "ÃƒÂ Ã‚Â¨Ã‚Â¸ÃƒÂ Ã‚Â¨Ã‚Â¼ÃƒÂ Ã‚Â©Ã‚ÂÃƒÂ Ã‚Â¨Ã‚Â°ÃƒÂ Ã‚Â©Ã¢â‚¬Å¡ ÃƒÂ Ã‚Â¨Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¨Ã‚Â°ÃƒÂ Ã‚Â©Ã¢â‚¬Â¹",
+        "à¨–à©‹à¨²à©à¨¹à©‹", "à¨–à©‹à¨²à©à¨¹", "à¨–à©‹à¨²à©à¨¹ à¨¦à¨¿à¨“", "à¨šà¨¾à¨²à©‚ à¨•à¨°à©‹", "à¨¸à¨¼à©à¨°à©‚ à¨•à¨°à©‹",
         # Odia
-        "ÃƒÂ Ã‚Â¬Ã¢â‚¬â€œÃƒÂ Ã‚Â­Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¬Ã‚Â²", "ÃƒÂ Ã‚Â¬Ã¢â‚¬â€œÃƒÂ Ã‚Â­Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¬Ã‚Â²ÃƒÂ Ã‚Â¬Ã‚Â¨ÃƒÂ Ã‚Â­Ã‚ÂÃƒÂ Ã‚Â¬Ã‚Â¤ÃƒÂ Ã‚Â­Ã‚Â", "ÃƒÂ Ã‚Â¬Ã¢â‚¬â€œÃƒÂ Ã‚Â­Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¬Ã‚Â²ÃƒÂ Ã‚Â¬Ã‚Â¿ÃƒÂ Ã‚Â¬Ã‚Â¦ÃƒÂ Ã‚Â¬Ã‚Â¿ÃƒÂ Ã‚Â¬Ã¢â‚¬Â¦", "ÃƒÂ Ã‚Â¬Ã…Â¡ÃƒÂ Ã‚Â¬Ã‚Â¾ÃƒÂ Ã‚Â¬Ã‚Â²ÃƒÂ Ã‚Â­Ã‚Â ÃƒÂ Ã‚Â¬Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¬Ã‚Â°", "ÃƒÂ Ã‚Â¬Ã¢â‚¬Â ÃƒÂ Ã‚Â¬Ã‚Â°ÃƒÂ Ã‚Â¬Ã‚Â®ÃƒÂ Ã‚Â­Ã‚ÂÃƒÂ Ã‚Â¬Ã‚Â­ ÃƒÂ Ã‚Â¬Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¬Ã‚Â°",
+        "à¬–à­‹à¬²", "à¬–à­‹à¬²à¬¨à­à¬¤à­", "à¬–à­‹à¬²à¬¿à¬¦à¬¿à¬…", "à¬šà¬¾à¬²à­ à¬•à¬°", "à¬†à¬°à¬®à­à¬­ à¬•à¬°",
         # Assamese
-        "ÃƒÂ Ã‚Â¦Ã¢â‚¬â€œÃƒÂ Ã‚Â§Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢", "ÃƒÂ Ã‚Â¦Ã¢â‚¬â€œÃƒÂ Ã‚Â§Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¦Ã‚Â²", "ÃƒÂ Ã‚Â¦Ã¢â‚¬â€œÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â¦Ã‚Â¿ ÃƒÂ Ã‚Â¦Ã‚Â¦ÃƒÂ Ã‚Â¦Ã‚Â¿ÃƒÂ Ã‚Â¦Ã‚Â¯ÃƒÂ Ã‚Â¦Ã‚Â¼ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢", "ÃƒÂ Ã‚Â¦Ã…Â¡ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â§Ã‚Â ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â§Ã‚Â°ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢", "ÃƒÂ Ã‚Â¦Ã¢â‚¬Â ÃƒÂ Ã‚Â§Ã‚Â°ÃƒÂ Ã‚Â¦Ã‚Â®ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â­ ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â§Ã‚Â°ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢",
+        "à¦–à§‹à¦²à¦•", "à¦–à§‹à¦²", "à¦–à§à¦²à¦¿ à¦¦à¦¿à¦¯à¦¼à¦•", "à¦šà¦¾à¦²à§ à¦•à§°à¦•", "à¦†à§°à¦®à§à¦­ à¦•à§°à¦•",
     ]
 
     app_command_names = {
-        "chrome": ["chrome", "google chrome", "ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â°ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã‚Â®", "ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â°ÃƒÂ Ã‚Â§Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¦Ã‚Â®", "ÃƒÂ Ã‚Â°Ã¢â‚¬Â¢ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚Â°ÃƒÂ Ã‚Â±Ã¢â‚¬Â¹ÃƒÂ Ã‚Â°Ã‚Â®ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â°ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã‚Â®"],
-        "instagram": ["instagram", "insta", "ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¤Ã¢â‚¬Å¡ÃƒÂ Ã‚Â¤Ã‚Â¸ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã¢â‚¬â€ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â°ÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã‚Â®", "ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¦Ã‚Â¨ÃƒÂ Ã‚Â¦Ã‚Â¸ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã…Â¸ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã¢â‚¬â€ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â°ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã‚Â®", "ÃƒÂ Ã‚Â°Ã¢â‚¬Â¡ÃƒÂ Ã‚Â°Ã‚Â¨ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€™ÃƒÂ Ã‚Â°Ã‚Â¸ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã¢â‚¬â€ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚Â°ÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã‚Â®ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â®Ã¢â‚¬Â¡ÃƒÂ Ã‚Â®Ã‚Â©ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã‚Â¸ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â®Ã‚Â¾ÃƒÂ Ã‚Â®Ã¢â‚¬Â¢ÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã‚Â°ÃƒÂ Ã‚Â®Ã‚Â¾ÃƒÂ Ã‚Â®Ã‚Â®ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â²Ã¢â‚¬Â¡ÃƒÂ Ã‚Â²Ã‚Â¨ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€™ÃƒÂ Ã‚Â²Ã‚Â¸ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã…Â¸ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã¢â‚¬â€ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã‚Â°ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã‚Â®ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚ÂªÃ¢â‚¬Â¡ÃƒÂ Ã‚ÂªÃ‚Â¨ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ‚Â¸ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ…Â¸ÃƒÂ Ã‚ÂªÃ‚Â¾ÃƒÂ Ã‚ÂªÃ¢â‚¬â€ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ‚Â°ÃƒÂ Ã‚ÂªÃ‚Â¾ÃƒÂ Ã‚ÂªÃ‚Â®", "ÃƒÂ Ã‚Â´Ã¢â‚¬Â¡ÃƒÂ Ã‚ÂµÃ‚Â»ÃƒÂ Ã‚Â´Ã‚Â¸ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚Â´Ã‚Â¾ÃƒÂ Ã‚Â´Ã¢â‚¬â€ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â°ÃƒÂ Ã‚Â´Ã‚Â¾ÃƒÂ Ã‚Â´Ã¢â‚¬Å¡", "ÃƒÂ Ã‚Â¨Ã¢â‚¬Â¡ÃƒÂ Ã‚Â©Ã‚Â°ÃƒÂ Ã‚Â¨Ã‚Â¸ÃƒÂ Ã‚Â¨Ã…Â¸ÃƒÂ Ã‚Â¨Ã‚Â¾ÃƒÂ Ã‚Â¨Ã¢â‚¬â€ÃƒÂ Ã‚Â©Ã‚ÂÃƒÂ Ã‚Â¨Ã‚Â°ÃƒÂ Ã‚Â¨Ã‚Â¾ÃƒÂ Ã‚Â¨Ã‚Â®", "ÃƒËœÃ‚Â§Ãƒâ„¢Ã¢â‚¬Â ÃƒËœÃ‚Â³Ãƒâ„¢Ã‚Â¹ÃƒËœÃ‚Â§ÃƒÅ¡Ã‚Â¯ÃƒËœÃ‚Â±ÃƒËœÃ‚Â§Ãƒâ„¢Ã¢â‚¬Â¦"],
-        "whatsapp": ["whatsapp", "ÃƒÂ Ã‚Â¤Ã‚ÂµÃƒÂ Ã‚Â¥Ã¢â‚¬Â°ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¸ÃƒÂ Ã‚Â¤Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Âª", "ÃƒÂ Ã‚Â¤Ã‚ÂµÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¹ÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¸ÃƒÂ Ã‚Â¤Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Âª", "ÃƒÂ Ã‚Â¤Ã‚ÂµÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¹ÃƒÂ Ã‚Â¤Ã‚Â¾ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¸ÃƒÂ Ã‚Â¤Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Âª", "ÃƒÂ Ã‚Â¦Ã‚Â¹ÃƒÂ Ã‚Â§Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¦Ã‚Â¯ÃƒÂ Ã‚Â¦Ã‚Â¼ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã…Â¸ÃƒÂ Ã‚Â¦Ã‚Â¸ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¦ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â¯ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã‚Âª", "ÃƒÂ Ã‚Â°Ã‚ÂµÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚Â¸ÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã‚ÂªÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â®Ã‚ÂµÃƒÂ Ã‚Â®Ã‚Â¾ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã‚Â¸ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã¢â‚¬Â¦ÃƒÂ Ã‚Â®Ã‚ÂªÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â²Ã‚ÂµÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã…Â¸ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã‚Â¸ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã‚ÂªÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚ÂªÃ‚ÂµÃƒÂ Ã‚Â«Ã¢â‚¬Â¹ÃƒÂ Ã‚ÂªÃ…Â¸ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ‚Â¸ÃƒÂ Ã‚ÂªÃ‚ÂÃƒÂ Ã‚ÂªÃ‚Âª", "ÃƒÂ Ã‚Â´Ã‚ÂµÃƒÂ Ã‚Â´Ã‚Â¾ÃƒÂ Ã‚Â´Ã…Â¸ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã…Â¸ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â¸ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã¢â‚¬Â ÃƒÂ Ã‚Â´Ã‚ÂªÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚ÂªÃƒÂ Ã‚ÂµÃ‚Â", "ÃƒÂ Ã‚Â¨Ã‚ÂµÃƒÂ Ã‚Â¨Ã…Â¸ÃƒÂ Ã‚Â¨Ã‚Â¸ÃƒÂ Ã‚Â¨Ã‚ÂÃƒÂ Ã‚Â¨Ã‚Âª", "Ãƒâ„¢Ã‹â€ ÃƒËœÃ‚Â§Ãƒâ„¢Ã‚Â¹ÃƒËœÃ‚Â³ ÃƒËœÃ‚Â§Ãƒâ€ºÃ…â€™Ãƒâ„¢Ã‚Â¾"],
-        "chatgpt": ["chatgpt", "chat gpt", "ÃƒÂ Ã‚Â¤Ã…Â¡ÃƒÂ Ã‚Â¥Ã‹â€ ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¤Ã…â€œÃƒÂ Ã‚Â¥Ã¢â€šÂ¬ÃƒÂ Ã‚Â¤Ã‚ÂªÃƒÂ Ã‚Â¥Ã¢â€šÂ¬ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¥Ã¢â€šÂ¬", "ÃƒÂ Ã‚Â¦Ã…Â¡ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â¯ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã…Â¸ÃƒÂ Ã‚Â¦Ã…â€œÃƒÂ Ã‚Â¦Ã‚Â¿ÃƒÂ Ã‚Â¦Ã‚ÂªÃƒÂ Ã‚Â¦Ã‚Â¿ÃƒÂ Ã‚Â¦Ã…Â¸ÃƒÂ Ã‚Â¦Ã‚Â¿", "ÃƒÂ Ã‚Â°Ã…Â¡ÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€™ÃƒÂ Ã‚Â°Ã…â€œÃƒÂ Ã‚Â°Ã‚Â¿ÃƒÂ Ã‚Â°Ã‚ÂªÃƒÂ Ã‚Â°Ã‚Â¿ÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â°Ã‚Â¿", "ÃƒÂ Ã‚Â®Ã…Â¡ÃƒÂ Ã‚Â®Ã‚Â¾ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã…â€œÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã‚ÂªÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â®Ã‚Â¿", "ÃƒÂ Ã‚Â²Ã…Â¡ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã…Â¸ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€™ÃƒÂ Ã‚Â²Ã…â€œÃƒÂ Ã‚Â²Ã‚Â¿ÃƒÂ Ã‚Â²Ã‚ÂªÃƒÂ Ã‚Â²Ã‚Â¿ÃƒÂ Ã‚Â²Ã…Â¸ÃƒÂ Ã‚Â²Ã‚Â¿", "ÃƒÂ Ã‚ÂªÃ…Â¡ÃƒÂ Ã‚Â«Ã¢â‚¬Â¡ÃƒÂ Ã‚ÂªÃ…Â¸ÃƒÂ Ã‚ÂªÃ…â€œÃƒÂ Ã‚Â«Ã¢â€šÂ¬ÃƒÂ Ã‚ÂªÃ‚ÂªÃƒÂ Ã‚ÂªÃ‚Â¿ÃƒÂ Ã‚ÂªÃ…Â¸ÃƒÂ Ã‚Â«Ã¢â€šÂ¬", "ÃƒÂ Ã‚Â´Ã…Â¡ÃƒÂ Ã‚Â´Ã‚Â¾ÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã…â€œÃƒÂ Ã‚Â´Ã‚Â¿ÃƒÂ Ã‚Â´Ã‚ÂªÃƒÂ Ã‚Â´Ã‚Â¿ÃƒÂ Ã‚Â´Ã…Â¸ÃƒÂ Ã‚Â´Ã‚Â¿", "ÃƒÂ Ã‚Â¨Ã…Â¡ÃƒÂ Ã‚Â©Ã‹â€ ÃƒÂ Ã‚Â¨Ã…Â¸ÃƒÂ Ã‚Â¨Ã…â€œÃƒÂ Ã‚Â©Ã¢â€šÂ¬ÃƒÂ Ã‚Â¨Ã‚ÂªÃƒÂ Ã‚Â©Ã¢â€šÂ¬ÃƒÂ Ã‚Â¨Ã…Â¸ÃƒÂ Ã‚Â©Ã¢â€šÂ¬"],
-        "claude": ["claude", "anthropic", "ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â²ÃƒÂ Ã‚Â¥Ã¢â‚¬Â°ÃƒÂ Ã‚Â¤Ã‚Â¡", "ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â¦Ã‚Â¡", "ÃƒÂ Ã‚Â°Ã¢â‚¬Â¢ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚Â²ÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã‚Â¡ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â®Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã‚Â³ÃƒÂ Ã‚Â®Ã‚Â¾ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â²Ã¢â‚¬Â¢ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã‚Â²ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã‚Â¡ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚ÂªÃ¢â‚¬Â¢ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ‚Â²ÃƒÂ Ã‚Â«Ã¢â‚¬Â¹ÃƒÂ Ã‚ÂªÃ‚Â¡", "ÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â²ÃƒÂ Ã‚ÂµÃ¢â‚¬Â¹ÃƒÂ Ã‚Â´Ã‚Â¡ÃƒÂ Ã‚ÂµÃ‚Â", "ÃƒÂ Ã‚Â¨Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¨Ã‚Â²ÃƒÂ Ã‚Â©Ã…â€™ÃƒÂ Ã‚Â¨Ã‚Â¡"],
-        "vscode": ["vscode", "vs code", "visual studio code", "ÃƒÂ Ã‚Â¤Ã‚ÂµÃƒÂ Ã‚Â¥Ã¢â€šÂ¬ÃƒÂ Ã‚Â¤Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¸ ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã‚Â¡", "ÃƒÂ Ã‚Â¤Ã‚ÂµÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¹ÃƒÂ Ã‚Â¥Ã¢â€šÂ¬ÃƒÂ Ã‚Â¤Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â¸ ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã‚Â¡", "ÃƒÂ Ã‚Â¦Ã‚Â­ÃƒÂ Ã‚Â¦Ã‚Â¿ÃƒÂ Ã‚Â¦Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â¸ ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â§Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¦Ã‚Â¡", "ÃƒÂ Ã‚Â°Ã‚ÂµÃƒÂ Ã‚Â±Ã¢â€šÂ¬ÃƒÂ Ã‚Â°Ã…Â½ÃƒÂ Ã‚Â°Ã‚Â¸ÃƒÂ Ã‚Â±Ã‚Â ÃƒÂ Ã‚Â°Ã¢â‚¬Â¢ÃƒÂ Ã‚Â±Ã¢â‚¬Â¹ÃƒÂ Ã‚Â°Ã‚Â¡ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â®Ã‚ÂµÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã…Â½ÃƒÂ Ã‚Â®Ã‚Â¸ÃƒÂ Ã‚Â¯Ã‚Â ÃƒÂ Ã‚Â®Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¯Ã¢â‚¬Â¹ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â²Ã‚ÂµÃƒÂ Ã‚Â²Ã‚Â¿ÃƒÂ Ã‚Â²Ã…Â½ÃƒÂ Ã‚Â²Ã‚Â¸ÃƒÂ Ã‚Â³Ã‚Â ÃƒÂ Ã‚Â²Ã¢â‚¬Â¢ÃƒÂ Ã‚Â³Ã¢â‚¬Â¹ÃƒÂ Ã‚Â²Ã‚Â¡ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚ÂªÃ‚ÂµÃƒÂ Ã‚Â«Ã¢â€šÂ¬.ÃƒÂ Ã‚ÂªÃ‚ÂÃƒÂ Ã‚ÂªÃ‚Â¸. ÃƒÂ Ã‚ÂªÃ¢â‚¬Â¢ÃƒÂ Ã‚Â«Ã¢â‚¬Â¹ÃƒÂ Ã‚ÂªÃ‚Â¡", "ÃƒÂ Ã‚Â´Ã‚ÂµÃƒÂ Ã‚Â´Ã‚Â¿ÃƒÂ Ã‚Â´Ã…Â½ÃƒÂ Ã‚Â´Ã‚Â¸ÃƒÂ Ã‚ÂµÃ‚Â ÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚ÂµÃ¢â‚¬Â¹ÃƒÂ Ã‚Â´Ã‚Â¡ÃƒÂ Ã‚ÂµÃ‚Â", "ÃƒÂ Ã‚Â¨Ã‚ÂµÃƒÂ Ã‚Â©Ã¢â€šÂ¬ÃƒÂ Ã‚Â¨Ã‚ÂÃƒÂ Ã‚Â¨Ã‚Â¸ ÃƒÂ Ã‚Â¨Ã¢â‚¬Â¢ÃƒÂ Ã‚Â©Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¨Ã‚Â¡"],
-        "notepad": ["notepad", "ÃƒÂ Ã‚Â¤Ã‚Â¨ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¤Ã‚ÂªÃƒÂ Ã‚Â¥Ã‹â€ ÃƒÂ Ã‚Â¤Ã‚Â¡", "ÃƒÂ Ã‚Â¦Ã‚Â¨ÃƒÂ Ã‚Â§Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¦Ã…Â¸ÃƒÂ Ã‚Â¦Ã‚ÂªÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â¯ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã‚Â¡", "ÃƒÂ Ã‚Â°Ã‚Â¨ÃƒÂ Ã‚Â±Ã¢â‚¬Â¹ÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€™ÃƒÂ Ã‚Â°Ã‚ÂªÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚Â¯ÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã‚Â¡ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â®Ã‚Â¨ÃƒÂ Ã‚Â¯Ã¢â‚¬Â¹ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã‚ÂªÃƒÂ Ã‚Â¯Ã¢â‚¬Â¡ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â²Ã‚Â¨ÃƒÂ Ã‚Â³Ã¢â‚¬Â¹ÃƒÂ Ã‚Â²Ã…Â¸ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€™ÃƒÂ Ã‚Â²Ã‚ÂªÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã‚Â¯ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã‚Â¡ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚ÂªÃ‚Â¨ÃƒÂ Ã‚Â«Ã¢â‚¬Â¹ÃƒÂ Ã‚ÂªÃ…Â¸ÃƒÂ Ã‚ÂªÃ‚ÂªÃƒÂ Ã‚Â«Ã¢â‚¬Â¡ÃƒÂ Ã‚ÂªÃ‚Â¡", "ÃƒÂ Ã‚Â´Ã‚Â¨ÃƒÂ Ã‚ÂµÃ¢â‚¬Â¹ÃƒÂ Ã‚Â´Ã…Â¸ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã…Â¸ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚ÂªÃƒÂ Ã‚Â´Ã‚Â¾ÃƒÂ Ã‚Â´Ã‚Â¡ÃƒÂ Ã‚ÂµÃ‚Â", "ÃƒÂ Ã‚Â¨Ã‚Â¨ÃƒÂ Ã‚Â©Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¨Ã…Â¸ÃƒÂ Ã‚Â¨Ã‚ÂªÃƒÂ Ã‚Â©Ã‹â€ ÃƒÂ Ã‚Â¨Ã‚Â¡"],
-        "calculator": ["calculator", "calc", "ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¥Ã‹â€ ÃƒÂ Ã‚Â¤Ã‚Â²ÃƒÂ Ã‚Â¤Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¥Ã‚ÂÃƒÂ Ã‚Â¤Ã‚Â²ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¤Ã…Â¸ÃƒÂ Ã‚Â¤Ã‚Â°", "ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â¯ÃƒÂ Ã‚Â¦Ã‚Â¾ÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¢ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã‚Â²ÃƒÂ Ã‚Â§Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¦Ã…Â¸ÃƒÂ Ã‚Â¦Ã‚Â°", "ÃƒÂ Ã‚Â°Ã¢â‚¬Â¢ÃƒÂ Ã‚Â°Ã‚Â¾ÃƒÂ Ã‚Â°Ã‚Â²ÃƒÂ Ã‚Â°Ã‚Â¿ÃƒÂ Ã‚Â°Ã¢â‚¬Â¢ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚Â¯ÃƒÂ Ã‚Â±Ã‚ÂÃƒÂ Ã‚Â°Ã‚Â²ÃƒÂ Ã‚Â±Ã¢â‚¬Â¡ÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â°Ã‚Â°ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â®Ã¢â‚¬Â¢ÃƒÂ Ã‚Â®Ã‚Â¾ÃƒÂ Ã‚Â®Ã‚Â²ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã¢â‚¬Â¢ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã‚Â²ÃƒÂ Ã‚Â¯Ã¢â‚¬Â¡ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â®Ã‚Â°ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â²Ã¢â‚¬Â¢ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã‚Â¯ÃƒÂ Ã‚Â²Ã‚Â¾ÃƒÂ Ã‚Â²Ã‚Â²ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã¢â‚¬Â¢ÃƒÂ Ã‚Â³Ã‚ÂÃƒÂ Ã‚Â²Ã‚Â²ÃƒÂ Ã‚Â³Ã¢â‚¬Â¡ÃƒÂ Ã‚Â²Ã…Â¸ÃƒÂ Ã‚Â²Ã‚Â°ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚ÂªÃ¢â‚¬Â¢ÃƒÂ Ã‚Â«Ã¢â‚¬Â¡ÃƒÂ Ã‚ÂªÃ‚Â²ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ¢â‚¬Â¢ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ‚Â¯ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ‚Â²ÃƒÂ Ã‚Â«Ã¢â‚¬Â¡ÃƒÂ Ã‚ÂªÃ…Â¸ÃƒÂ Ã‚ÂªÃ‚Â°", "ÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚Â´Ã‚Â¾ÃƒÂ Ã‚ÂµÃ‚Â½ÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã¢â‚¬Â¢ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â²ÃƒÂ Ã‚ÂµÃ¢â‚¬Â¡ÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚ÂµÃ‚Â¼", "ÃƒÂ Ã‚Â¨Ã¢â‚¬Â¢ÃƒÂ Ã‚Â©Ã‹â€ ÃƒÂ Ã‚Â¨Ã‚Â²ÃƒÂ Ã‚Â¨Ã¢â‚¬Â¢ÃƒÂ Ã‚Â©Ã‚ÂÃƒÂ Ã‚Â¨Ã‚Â²ÃƒÂ Ã‚Â©Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¨Ã…Â¸ÃƒÂ Ã‚Â¨Ã‚Â°"],
-        "paint": ["paint", "ms paint", "ÃƒÂ Ã‚Â¤Ã‚ÂªÃƒÂ Ã‚Â¥Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¤Ã¢â‚¬Å¡ÃƒÂ Ã‚Â¤Ã…Â¸", "ÃƒÂ Ã‚Â¦Ã‚ÂªÃƒÂ Ã‚Â§Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¦Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¦Ã‚Â¨ÃƒÂ Ã‚Â§Ã‚ÂÃƒÂ Ã‚Â¦Ã…Â¸", "ÃƒÂ Ã‚Â°Ã‚ÂªÃƒÂ Ã‚Â±Ã¢â‚¬Â ÃƒÂ Ã‚Â°Ã‚Â¯ÃƒÂ Ã‚Â°Ã‚Â¿ÃƒÂ Ã‚Â°Ã¢â‚¬Å¡ÃƒÂ Ã‚Â°Ã…Â¸ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â®Ã‚ÂªÃƒÂ Ã‚Â¯Ã¢â‚¬Â ÃƒÂ Ã‚Â®Ã‚Â¯ÃƒÂ Ã‚Â®Ã‚Â¿ÃƒÂ Ã‚Â®Ã‚Â£ÃƒÂ Ã‚Â¯Ã‚ÂÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â²Ã‚ÂªÃƒÂ Ã‚Â³Ã¢â‚¬Â¡ÃƒÂ Ã‚Â²Ã¢â‚¬Å¡ÃƒÂ Ã‚Â²Ã…Â¸ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚ÂªÃ‚ÂªÃƒÂ Ã‚Â«Ã¢â‚¬Â¡ÃƒÂ Ã‚ÂªÃ¢â‚¬Â¡ÃƒÂ Ã‚ÂªÃ‚Â¨ÃƒÂ Ã‚Â«Ã‚ÂÃƒÂ Ã‚ÂªÃ…Â¸", "ÃƒÂ Ã‚Â´Ã‚ÂªÃƒÂ Ã‚ÂµÃ¢â‚¬Â ÃƒÂ Ã‚Â´Ã‚Â¯ÃƒÂ Ã‚Â´Ã‚Â¿ÃƒÂ Ã‚Â´Ã‚Â¨ÃƒÂ Ã‚ÂµÃ‚ÂÃƒÂ Ã‚Â´Ã‚Â±ÃƒÂ Ã‚ÂµÃ‚Â", "ÃƒÂ Ã‚Â¨Ã‚ÂªÃƒÂ Ã‚Â©Ã¢â‚¬Â¡ÃƒÂ Ã‚Â¨Ã¢â‚¬Å¡ÃƒÂ Ã‚Â¨Ã…Â¸"],
-        "node": ["node", "nodejs", "node js", "ÃƒÂ Ã‚Â¤Ã‚Â¨ÃƒÂ Ã‚Â¥Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¤Ã‚Â¡", "ÃƒÂ Ã‚Â¦Ã‚Â¨ÃƒÂ Ã‚Â§Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¦Ã‚Â¡", "ÃƒÂ Ã‚Â°Ã‚Â¨ÃƒÂ Ã‚Â±Ã¢â‚¬Â¹ÃƒÂ Ã‚Â°Ã‚Â¡ÃƒÂ Ã‚Â±Ã‚Â", "ÃƒÂ Ã‚Â®Ã‚Â¨ÃƒÂ Ã‚Â¯Ã¢â‚¬Â¹ÃƒÂ Ã‚Â®Ã…Â¸ÃƒÂ Ã‚Â¯Ã‚Â", "ÃƒÂ Ã‚Â²Ã‚Â¨ÃƒÂ Ã‚Â³Ã¢â‚¬Â¹ÃƒÂ Ã‚Â²Ã‚Â¡ÃƒÂ Ã‚Â³Ã‚Â", "ÃƒÂ Ã‚ÂªÃ‚Â¨ÃƒÂ Ã‚Â«Ã¢â‚¬Â¹ÃƒÂ Ã‚ÂªÃ‚Â¡", "ÃƒÂ Ã‚Â´Ã‚Â¨ÃƒÂ Ã‚ÂµÃ¢â‚¬Â¹ÃƒÂ Ã‚Â´Ã‚Â¡ÃƒÂ Ã‚ÂµÃ‚Â", "ÃƒÂ Ã‚Â¨Ã‚Â¨ÃƒÂ Ã‚Â©Ã¢â‚¬Â¹ÃƒÂ Ã‚Â¨Ã‚Â¡"],
+        "chrome": ["chrome", "google chrome", "à¤•à¥à¤°à¥‹à¤®", "à¦•à§à¦°à§‹à¦®", "à°•à±à°°à±‹à°®à±", "à¤•à¥à¤°à¥‹à¤®"],
+        "instagram": ["instagram", "insta", "à¤‡à¤‚à¤¸à¥à¤Ÿà¤¾à¤—à¥à¤°à¤¾à¤®", "à¦‡à¦¨à¦¸à§à¦Ÿà¦¾à¦—à§à¦°à¦¾à¦®", "à°‡à°¨à±â€Œà°¸à±à°Ÿà°¾à°—à±à°°à°¾à°®à±", "à®‡à®©à¯à®¸à¯à®Ÿà®¾à®•à®¿à®°à®¾à®®à¯", "à²‡à²¨à³â€Œà²¸à³à²Ÿà²¾à²—à³à²°à²¾à²®à³", "àª‡àª¨à«àª¸à«àªŸàª¾àª—à«àª°àª¾àª®", "à´‡àµ»à´¸àµà´±àµà´±à´¾à´—àµà´°à´¾à´‚", "à¨‡à©°à¨¸à¨Ÿà¨¾à¨—à©à¨°à¨¾à¨®", "Ø§Ù†Ø³Ù¹Ø§Ú¯Ø±Ø§Ù…"],
+        "whatsapp": ["whatsapp", "à¤µà¥‰à¤Ÿà¥à¤¸à¤à¤ª", "à¤µà¥à¤¹à¤¾à¤Ÿà¥à¤¸à¤à¤ª", "à¤µà¥à¤¹à¤¾à¤Ÿà¥à¤¸à¤à¤ª", "à¦¹à§‹à¦¯à¦¼à¦¾à¦Ÿà¦¸à¦…à§à¦¯à¦¾à¦ª", "à°µà°¾à°Ÿà±à°¸à°¾à°ªà±", "à®µà®¾à®Ÿà¯à®¸à¯à®…à®ªà¯", "à²µà²¾à²Ÿà³à²¸à²¾à²ªà³", "àªµà«‹àªŸà«àª¸àªàªª", "à´µà´¾à´Ÿàµà´Ÿàµà´¸àµà´†à´ªàµà´ªàµ", "à¨µà¨Ÿà¨¸à¨à¨ª", "ÙˆØ§Ù¹Ø³ Ø§ÛŒÙ¾"],
+        "chatgpt": ["chatgpt", "chat gpt", "à¤šà¥ˆà¤Ÿà¤œà¥€à¤ªà¥€à¤Ÿà¥€", "à¦šà§à¦¯à¦¾à¦Ÿà¦œà¦¿à¦ªà¦¿à¦Ÿà¦¿", "à°šà°¾à°Ÿà±â€Œà°œà°¿à°ªà°¿à°Ÿà°¿", "à®šà®¾à®Ÿà¯à®œà®¿à®ªà®¿à®Ÿà®¿", "à²šà²¾à²Ÿà³â€Œà²œà²¿à²ªà²¿à²Ÿà²¿", "àªšà«‡àªŸàªœà«€àªªàª¿àªŸà«€", "à´šà´¾à´±àµà´±àµà´œà´¿à´ªà´¿à´Ÿà´¿", "à¨šà©ˆà¨Ÿà¨œà©€à¨ªà©€à¨Ÿà©€"],
+        "claude": ["claude", "anthropic", "à¤•à¥à¤²à¥‰à¤¡", "à¦•à§à¦²à¦¡", "à°•à±à°²à°¾à°¡à±", "à®•à¯à®³à®¾à®Ÿà¯", "à²•à³à²²à²¾à²¡à³", "àª•à«àª²à«‹àª¡", "à´•àµà´²àµ‹à´¡àµ", "à¨•à¨²à©Œà¨¡"],
+        "vscode": ["vscode", "vs code", "visual studio code", "à¤µà¥€à¤à¤¸ à¤•à¥‹à¤¡", "à¤µà¥à¤¹à¥€à¤à¤¸ à¤•à¥‹à¤¡", "à¦­à¦¿à¦à¦¸ à¦•à§‹à¦¡", "à°µà±€à°Žà°¸à± à°•à±‹à°¡à±", "à®µà®¿à®Žà®¸à¯ à®•à¯‹à®Ÿà¯", "à²µà²¿à²Žà²¸à³ à²•à³‹à²¡à³", "àªµà«€.àªàª¸. àª•à«‹àª¡", "à´µà´¿à´Žà´¸àµ à´•àµ‹à´¡àµ", "à¨µà©€à¨à¨¸ à¨•à©‹à¨¡"],
+        "notepad": ["notepad", "à¤¨à¥‹à¤Ÿà¤ªà¥ˆà¤¡", "à¦¨à§‹à¦Ÿà¦ªà§à¦¯à¦¾à¦¡", "à°¨à±‹à°Ÿà±â€Œà°ªà±à°¯à°¾à°¡à±", "à®¨à¯‹à®Ÿà¯à®ªà¯‡à®Ÿà¯", "à²¨à³‹à²Ÿà³â€Œà²ªà³à²¯à²¾à²¡à³", "àª¨à«‹àªŸàªªà«‡àª¡", "à´¨àµ‹à´Ÿàµà´Ÿàµà´ªà´¾à´¡àµ", "à¨¨à©‹à¨Ÿà¨ªà©ˆà¨¡"],
+        "calculator": ["calculator", "calc", "à¤•à¥ˆà¤²à¤•à¥à¤²à¥‡à¤Ÿà¤°", "à¦•à§à¦¯à¦¾à¦²à¦•à§à¦²à§‡à¦Ÿà¦°", "à°•à°¾à°²à°¿à°•à±à°¯à±à°²à±‡à°Ÿà°°à±", "à®•à®¾à®²à¯à®•à¯à®²à¯‡à®Ÿà¯à®Ÿà®°à¯", "à²•à³à²¯à²¾à²²à³à²•à³à²²à³‡à²Ÿà²°à³", "àª•à«‡àª²à«àª•à«àª¯à«àª²à«‡àªŸàª°", "à´•à´¾àµ½à´•àµà´•àµà´²àµ‡à´±àµà´±àµ¼", "à¨•à©ˆà¨²à¨•à©à¨²à©‡à¨Ÿà¨°"],
+        "paint": ["paint", "ms paint", "à¤ªà¥‡à¤‚à¤Ÿ", "à¦ªà§‡à¦‡à¦¨à§à¦Ÿ", "à°ªà±†à°¯à°¿à°‚à°Ÿà±", "à®ªà¯†à®¯à®¿à®£à¯à®Ÿà¯", "à²ªà³‡à²‚à²Ÿà³", "àªªà«‡àª‡àª¨à«àªŸ", "à´ªàµ†à´¯à´¿à´¨àµà´±àµ", "à¨ªà©‡à¨‚à¨Ÿ"],
+        "node": ["node", "nodejs", "node js", "à¤¨à¥‹à¤¡", "à¦¨à§‹à¦¡", "à°¨à±‹à°¡à±", "à®¨à¯‹à®Ÿà¯", "à²¨à³‹à²¡à³", "àª¨à«‹àª¡", "à´¨àµ‹à´¡àµ", "à¨¨à©‹à¨¡"],
     }
 
     # Check app name + an Indian-language open/launch verb.
@@ -1510,7 +1154,7 @@ def understand(text):
         return {"action": "music_mode_toggle", "target": ""}
 
 # JARVIS_MUSIC_ROUTING_V1
-    # LOCAL MUSIC ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â NO YOUTUBE
+    # LOCAL MUSIC â€” NO YOUTUBE
     # =====================================================
     music_play_match = re.match(
         r"^(?:please\s+)?(?:play|bajao|chalao)\s+(?:the\s+)?(?:song\s+|music\s+)?(.+)$",
@@ -1522,7 +1166,7 @@ def understand(text):
             return {"action": "music_play", "target": music_query}
 
     if c in {"play music", "music play karo", "music chalao", "music bajao", "music play"}:
-        return {"action": "music_Play", "target": ""}
+        return {"action": "music_play", "target": ""}
 
     if c in {"pause music", "music pause karo", "music rok do", "music pause"}:
         return {"action": "music_pause", "target": ""}
@@ -1652,21 +1296,7 @@ def understand(text):
     # AI CHAT + MEMORY
     # =====================================================
 
-    print("ÃƒÂ°Ã…Â¸Ã‚Â§Ã‚Â  Jarvis AI thinking...")
-
-    # JARVIS_MUSIC_ROUTER_FIX
-    _mc = c.strip().lower()
-    for _prefix in (
-        "play ",
-        "play song ",
-        "gaana chalao ",
-        "song chalao ",
-        "music bajao ",
-        "music chalao ",
-    ):
-        if _mc.startswith(_prefix):
-            original = _mc[len(_prefix):].strip()
-            break
+    print("ðŸ§  Jarvis AI thinking...")
 
     response = ask_ai(original)
 
@@ -1679,15 +1309,6 @@ def understand(text):
         "action": "chat",
         "response": response
     }
-
-
-
-
-
-
-
-
-
 
 
 

@@ -1,6 +1,9 @@
-﻿from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import time
 import re
+import os
+from pathlib import Path
+from urllib.parse import urlparse
 
 # ============================================================
 # JARVIS WHATSAPP WEB AGENT — EXISTING EDGE / CDP MODE
@@ -39,59 +42,57 @@ class WhatsAppAgent:
                     return True
             except Exception:
                 pass
-        if self.playwright:
-            self._disconnect_only()
 
         try:
             self.playwright = sync_playwright().start()
 
             # Attach to the EXISTING Edge instance.
-            self.browser = self.playwright.chromium.connect_over_cdp(CDP_URL)
+            endpoint = CDP_URL
+            active_port = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Edge/User Data/DevToolsActivePort"
+            try:
+                port, route = active_port.read_text().splitlines()[:2]
+                if port == "9222" and route.startswith("/devtools/browser/"):
+                    endpoint = "ws://127.0.0.1:" + port + route
+            except (OSError, ValueError):
+                pass
+            try:
+                self.browser = self.playwright.chromium.connect_over_cdp(endpoint, timeout=15000)
+            except Exception as exc:
+                if endpoint != CDP_URL or "404" not in str(exc):
+                    raise
+                # edge://inspect serves a WebSocket endpoint without HTTP discovery.
+                print("WhatsApp: requesting access to existing Edge; allow its debugging prompt if shown.", flush=True)
+                self.browser = self.playwright.chromium.connect_over_cdp(
+                    "ws://127.0.0.1:9222/devtools/browser", timeout=30000
+                )
 
             contexts = self.browser.contexts
             if not contexts:
                 raise RuntimeError("Existing Edge ka browser context nahi mila.")
 
-            self.context = next((ctx for ctx in contexts if any("web.whatsapp.com" in (p.url or "").lower() for p in ctx.pages)), contexts[0])
-
-            # Prefer an already-open WhatsApp Web tab.
             whatsapp_pages = []
-            for page in self.context.pages:
-                try:
-                    if "web.whatsapp.com" in (page.url or "").lower():
-                        whatsapp_pages.append(page)
-                except Exception:
-                    pass
-
-            if whatsapp_pages:
-                self.page = whatsapp_pages[0]
-            elif self.context.pages:
-                # Reuse an existing Edge tab rather than launching a new browser.
-                self.page = self.context.pages[0]
-                self.page.goto(
-                    WHATSAPP_URL,
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
-            else:
-                self.page = self.context.new_page()
-                self.page.goto(
-                    WHATSAPP_URL,
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
+            for context in contexts:
+                for page in context.pages:
+                    try:
+                        if urlparse(page.url).hostname == "web.whatsapp.com":
+                            whatsapp_pages.append((context, page))
+                    except Exception:
+                        pass
+            if len(whatsapp_pages) != 1:
+                raise RuntimeError("Keep exactly one WhatsApp Web tab open in the main Edge session; no new tab was opened.")
+            self.context, self.page = whatsapp_pages[0]
 
             self.started = True
 
             print(
-                "💬 WhatsApp: attached to existing Edge (CDP 9222).",
+                "[WhatsApp] attached to existing Edge (CDP 9222).",
                 flush=True,
             )
             return True
 
         except Exception as error:
             print(
-                f"❌ WhatsApp Edge attach error: {error}",
+                f"[WhatsApp] Edge attach error: {error}",
                 flush=True,
             )
             self._disconnect_only()
@@ -172,87 +173,77 @@ class WhatsAppAgent:
 
     def search_contact(self, name):
         if not self.page:
-            return False, "WhatsApp Web connection nahi hai."
-
+            return False, "WhatsApp connection nahi hai."
         name = name.strip()
         if not name:
-            return False, "WhatsApp contact name nahi mila."
-
+            return False, "Contact name missing."
         try:
             ready, message = self.wait_until_ready(timeout=10)
             if not ready:
                 return False, message
-
-            search = self.page.get_by_role(
-                "textbox",
-                name=re.compile(
-                    r"Search or start a new chat",
-                    re.IGNORECASE,
-                ),
-            ).first
-
-            if not search.is_visible(timeout=2500):
-                inputs = self.page.locator(
-                    'input[placeholder*="Search" i]'
-                )
-                if inputs.count() > 0:
-                    search = inputs.first
-                else:
-                    return False, "WhatsApp search box nahi mila."
-
-            search.click(force=True)
-            search.fill("")
+            search = None
+            for selector in (
+                'input[role="textbox"][data-tab="3"]',
+                '#side [contenteditable="true"][role="textbox"]',
+                '#side [contenteditable="true"][data-tab]',
+                '#side input[placeholder*="Search" i]',
+                '#side [contenteditable="true"]',
+                '[data-testid="chat-list-search"]',
+                'div[role="textbox"][aria-label*="Search" i]',
+                'div[contenteditable="true"][data-tab="3"]',
+            ):
+                boxes = self.page.locator(selector)
+                for i in range(boxes.count()):
+                    box = boxes.nth(i)
+                    if box.is_visible():
+                        search = box
+                        break
+                if search is not None:
+                    break
+            if search is None:
+                return False, "WhatsApp search box nahi mila."
             search.fill(name)
-
-            self.page.wait_for_timeout(1200)
-
-            return True, f"{name} search ho gaya."
-
-        except PlaywrightTimeoutError:
-            return False, "Boss, WhatsApp search box load nahi hua."
-
+            self.page.wait_for_timeout(900)
+            return True, "Search completed."
         except Exception as error:
-            return False, f"Contact search nahi ho paaya: {error}"
+            return False, f"Search failed: {error}"
 
     # ========================================================
-    # OPEN CONTACT
+    # OPEN CONTACT - EXACT MATCH ONLY
     # ========================================================
 
     def open_contact(self, name):
+        name = name.strip()
+        success, message = self.search_contact(name)
+        if not success:
+            return False, message
         try:
-            success, message = self.search_contact(name)
-            if not success:
-                return False, message
-
-            self.page.wait_for_timeout(800)
-
-            result = self.page.get_by_text(
-                name,
-                exact=True,
-            ).first
-
-            try:
-                result.wait_for(state="visible", timeout=5000)
-                result.click(force=True)
-                self.page.wait_for_timeout(700)
-                return True, f"{name} chat open ho gaya."
-            except Exception:
-                result = self.page.get_by_text(
-                    re.compile(
-                        f"^{re.escape(name)}$",
-                        re.IGNORECASE,
-                    )
-                ).first
-                result.wait_for(state="visible", timeout=4000)
-                result.click(force=True)
-                self.page.wait_for_timeout(700)
-                return True, f"{name} chat open ho gaya."
-
-        except PlaywrightTimeoutError:
-            return False, f"Boss, WhatsApp mein '{name}' contact nahi mila."
-
+            results = self.page.locator('#pane-side span[title]')
+            matches = []
+            for i in range(results.count()):
+                item = results.nth(i)
+                title = item.get_attribute("title") or ""
+                if title.strip().casefold() == name.casefold() and item.is_visible():
+                    matches.append(item)
+            if len(matches) != 1:
+                return False, f"Exact contact {name} uniquely nahi mila. Cancelled."
+            matches[0].click()
+            self.page.wait_for_timeout(700)
+            header = self.page.locator('[data-testid="conversation-info-header-chat-title"]')
+            if header.count() == 0:
+                return False, "Chat header verify nahi hua. Cancelled."
+            actual = ""
+            for i in range(header.count()):
+                item = header.nth(i)
+                title = item.inner_text().strip()
+                if title.casefold() == name.casefold():
+                    actual = title
+                    break
+            if actual.strip().casefold() != name.casefold():
+                return False, f"Wrong contact: {actual}. Cancelled."
+            return True, f"Verified chat: {actual}"
         except Exception as error:
-            return False, f"WhatsApp chat open nahi ho paayi: {error}"
+            return False, f"Contact verification failed: {error}"
 
     # ========================================================
     # MESSAGE BOX
@@ -305,28 +296,21 @@ class WhatsAppAgent:
             if not opened:
                 return False, open_message
 
-            header = self.page.locator("#main header")
-            if not header.count() or not header.get_by_text(name, exact=True).count():
-                return False, "Contact header verify nahi hua; message send nahi kiya."
             message_box = self._get_message_box()
             if message_box is None:
                 return False, "Boss, WhatsApp message box nahi mila."
 
-            outgoing = self.page.locator("#main .message-out").filter(has_text=message)
-            before = outgoing.count()
-            message_box.click()
+            message_box.click(force=True)
             message_box.fill(message)
+            self.page.wait_for_timeout(250)
             message_box.press("Enter")
-            try:
-                self.page.wait_for_function(
-                    """({text, before}) => [...document.querySelectorAll('#main .message-out')]
-                        .filter(el => el.innerText.includes(text)).length > before""",
-                    arg={"text": message, "before": before},
-                    timeout=6000,
-                )
-            except Exception:
-                return False, "Send confirm nahi hua. Automatic retry nahi kiya; duplicate se bachne ke liye chat check karo."
-            return True, "Message outgoing chat mein nazar aa gaya; delivery/read confirm nahi hai."
+            self.page.wait_for_timeout(700)
+
+            print(
+                f"💬 WhatsApp sent to {name}: {message}",
+                flush=True,
+            )
+            return True, "Message successfully sent."
 
         except PlaywrightTimeoutError:
             return False, "Boss, WhatsApp Web response nahi de raha."

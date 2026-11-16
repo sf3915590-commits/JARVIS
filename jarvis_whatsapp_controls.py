@@ -92,45 +92,93 @@ def _visible(loc: Any) -> bool:
         return False
 
 
-def perform_call(agent: Any, contact: str, video: bool = False) -> tuple[bool, str]:
+def perform_call(agent, contact, video=False):
+    """Verified WhatsApp call. Fail closed on any mismatch."""
+    contact = str(contact or "").strip()
+    if not contact:
+        return False, "Contact name missing."
+
     if not agent.started and not agent.start():
-        return False, "WhatsApp Web se connection nahi ho paaya. Edge mein WhatsApp logged in hona chahiye."
+        return False, "WhatsApp connection failed."
+
     try:
         ok, detail = agent.open_contact(contact)
         if not ok:
             return False, detail
+
         page = agent.page
-        header = page.locator("#main header")
-        if not header.count() or not header.get_by_text(contact, exact=True).count():
-            return False, "Contact header verify nahi hua; call nahi ki."
-        page.wait_for_timeout(300)
-        desired = "video" if video else "voice"
-        buttons = page.get_by_role("button")
-        count = min(buttons.count(), 140)
-        for index in range(count):
-            button = buttons.nth(index)
-            try:
-                if not button.is_visible(timeout=100):
-                    continue
-                label = " ".join(filter(None, [
-                    button.get_attribute("aria-label"),
-                    button.get_attribute("title"),
-                    button.inner_text(timeout=150),
-                ])).lower()
-                if desired == "video":
-                    match = "video call" in label or ("video" in label and "call" in label)
-                else:
-                    match = ("voice call" in label) or (label.strip() in {"call", "voice call"})
-                    match = match and "video" not in label
-                if match:
-                    button.click(timeout=2500)
-                    page.wait_for_timeout(500)
-                    return True, f"WhatsApp {desired} call button click hua; ringing/connection verify nahi hui."
-            except Exception:
+        header = page.locator(
+            '[data-testid="conversation-info-header-chat-title"]'
+        )
+
+        if header.count() != 1:
+            return False, "CALL BLOCKED: header not verified."
+
+        actual = header.first.inner_text(timeout=3000).strip()
+        if actual.casefold() != contact.casefold():
+            return False, (
+                f"CALL BLOCKED: requested {contact}, opened {actual}."
+            )
+
+        print("[CALL VERIFIED]", actual, flush=True)
+
+        # Search only inside the active conversation header.
+        area = page.locator(
+            '[data-testid="conversation-header"]'
+        )
+        if area.count() != 1:
+            return False, "CALL BLOCKED: call toolbar missing."
+
+        buttons = area.locator("button")
+        candidates = []
+
+        for i in range(buttons.count()):
+            button = buttons.nth(i)
+            if not button.is_visible():
                 continue
-        return False, "Contact chat khul gaya, lekin WhatsApp Web ka call button verify nahi hua. Call manually start karo."
+
+            label = " ".join(
+                str(button.get_attribute(attr) or "")
+                for attr in ("aria-label", "title", "data-testid")
+            ).lower().strip()
+
+            if video:
+                match = (
+                    "video call" in label
+                    or "video-call" in label
+                )
+            else:
+                match = (
+                    "voice call" in label
+                    or "voice-call" in label
+                    or label in ("call", "call button")
+                )
+
+            if match:
+                candidates.append(button)
+
+        if len(candidates) != 1:
+            return False, (
+                "CALL BLOCKED: unique call button nahi mila. "
+                "WhatsApp UI inspection required."
+            )
+
+        # Reverify immediately before clicking.
+        current = header.first.inner_text(timeout=2000).strip()
+        if current.casefold() != contact.casefold():
+            return False, "CALL BLOCKED: chat changed."
+
+        candidates[0].click(timeout=2500)
+
+        return True, (
+            f"Verified {contact}; "
+            "WhatsApp call control clicked."
+        )
+
     except Exception as exc:
-        return False, f"WhatsApp call start nahi ho paayi: {type(exc).__name__}: {exc}"
+        return False, (
+            f"WhatsApp call failed: {type(exc).__name__}: {exc}"
+        )
 
 
 def set_read_receipts(agent: Any, enabled: bool) -> tuple[bool, str]:

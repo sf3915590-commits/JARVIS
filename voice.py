@@ -28,20 +28,76 @@ _barge_in = False
 _barge_stop = None
 
 
+def resolve_cartesia_api_keys():
+    """Return configured Cartesia keys in primary-then-fallback order."""
+    names = ("CARTESIA_API_KEY", "CARTESIA_API_KEY_FALLBACK")
+    values = {name: os.environ.get(name, "").strip() for name in names}
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            for name in names:
+                try:
+                    if not values[name]:
+                        values[name] = winreg.QueryValueEx(key, name)[0].strip()
+                except OSError:
+                    pass
+    except (ImportError, OSError):
+        pass
+    try:
+        from dotenv import dotenv_values
+        config = dotenv_values(Path(__file__).resolve().parent / ".env", interpolate=False)
+        for name in names:
+            if not values[name]:
+                values[name] = (config.get(name) or "").strip()
+    except ImportError:
+        pass
+    keys = []
+    for name in names:
+        key = values[name]
+        if key and key not in keys:
+            keys.append(key)
+            os.environ[name] = key
+    return keys
+
+
+def resolve_cartesia_api_key():
+    """Compatibility helper returning the primary key."""
+    keys = resolve_cartesia_api_keys()
+    return keys[0] if keys else ""
+
+
 async def generate_voice(text, output_file):
     def _generate():
-        client = Cartesia(api_key=os.environ["CARTESIA_API_KEY"])
-        response = client.tts.generate(
-            model_id="sonic-3.5",
-            transcript=text,
-            voice="6b02ffe5-e3cb-48c0-a023-c72f85953375",
-            output_format={
-                "container": "wav",
-                "encoding": "pcm_s16le",
-                "sample_rate": 44100,
-            },
-        )
-        response.write_to_file(str(output_file))
+        keys = resolve_cartesia_api_keys()
+        if not keys:
+            raise RuntimeError("CARTESIA_API_KEY is not configured")
+        last_error = None
+        for index, key in enumerate(keys):
+            try:
+                client = Cartesia(api_key=key, timeout=25.0, max_retries=0)
+                response = client.tts.generate(
+                    model_id="sonic-3.5",
+                    transcript=text,
+                    voice="47f3bbb1-e98f-4e0c-92c5-5f0325e1e206",
+                    output_format={
+                        "container": "wav",
+                        "encoding": "pcm_s16le",
+                        "sample_rate": 44100,
+                    },
+                )
+                response.write_to_file(str(output_file))
+                print("[TTS] Cartesia selected voice generated using " + ("primary" if index == 0 else "fallback") + " key.", flush=True)
+                return
+            except Exception as exc:
+                last_error = exc
+                status = getattr(exc, "status_code", None)
+                if status is None:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                # Only exhaustion triggers key rotation. Other failures should be
+                # surfaced immediately instead of hiding auth/config problems.
+                if status != 402 or index == len(keys) - 1:
+                    raise
+        raise last_error
 
     await asyncio.to_thread(_generate)
 
@@ -135,7 +191,7 @@ def speak(text):
     print(f"🔊 Jarvis: {text}", flush=True)
 
     content_hash = hashlib.sha256(
-        text.encode("utf-8")
+        ("cartesia_sonic35_47f3bbb1-e98f-4e0c-92c5-5f0325e1e206:" + text).encode("utf-8")
     ).hexdigest()[:16]
 
     safe_slug = "".join(
@@ -147,7 +203,28 @@ def speak(text):
 
     try:
         if not output_file.exists():
-            asyncio.run(generate_voice(text, output_file))
+            coroutine = generate_voice(text, output_file)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(coroutine)
+            else:
+                # Voice may be requested from JARVIS's active asyncio loop.
+                # Run Cartesia's coroutine on a short-lived worker loop and
+                # propagate errors to the existing offline TTS fallback.
+                result = {}
+                def _run_voice_job():
+                    try:
+                        result['value'] = asyncio.run(coroutine)
+                    except BaseException as exc:
+                        result['error'] = exc
+                worker = threading.Thread(target=_run_voice_job, daemon=True)
+                worker.start()
+                worker.join(timeout=35)
+                if worker.is_alive():
+                    raise TimeoutError('Cartesia TTS worker timed out')
+                if 'error' in result:
+                    raise result['error']
 
         stop_speaking()
 
@@ -187,3 +264,4 @@ def speak(text):
         _current_sound = None
         if _barge_stop is not None:
             _barge_stop.set()
+        raise

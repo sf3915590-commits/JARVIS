@@ -10,6 +10,7 @@ import sounddevice as sd
 import numpy as np
 from pathlib import Path
 import os
+import sys
 import subprocess
 import webbrowser
 
@@ -31,6 +32,12 @@ from music_agent import music  # JARVIS_MUSIC_BACKEND_V1
 from windows_control import launch_installed_app, close_app as close_windows_app
 from config import LANGUAGE, WAKE_WORDS
 from orchestrator import route as orchestrator_route
+from jarvis_chat_intent import detect_chat_mode_command as _detect_chat_mode_command
+from jarvis_chat_workspace_runtime import (
+    close_chat_workspace,
+    open_chat_workspace,
+    start_chat_workspace_services,
+)
 
 # JARVIS Music Core UI state
 _music_ui_mode = False
@@ -273,6 +280,8 @@ def _jarvis_source_command_router(command):
 # ============================================================
 
 whatsapp_agent = WhatsAppAgent()
+_whatsapp_ai_controller = None
+_whatsapp_ai_identity_confirmed = False
 
 MIC_DEVICE = None
 SAMPLE_RATE = None
@@ -1268,6 +1277,20 @@ def _looks_like_website_build_request(text):
     )
 
 
+def _looks_like_coding_task_request(text):
+    """Route explicit software-build requests to the existing Coding Agent."""
+    if _looks_like_website_build_request(text):
+        return True
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+    verbs = r"\b(create|build|develop|implement|write|make|code|banao|bana do|banado)\b"
+    products = r"\b(app|application|software|program|project|script|tool|game|api|backend|frontend|bot|desktop app|mobile app)\b"
+    technologies = r"\b(python|javascript|typescript|react|node(?:js)?|flask|django|fastapi|java|c\+\+|csharp)\b"
+    return bool(re.search(verbs, normalized) and (re.search(products, normalized) or re.search(technologies, normalized)))
+
+
 # ============================================================
 # JARVIS ROUTER WRAPPER
 # Keep brain.py for real action/memory routing, but send ordinary
@@ -1429,6 +1452,10 @@ def _jarvis_route_pending_quiz(command):
 
 def _jarvis_instant_command(text):
     """Fast deterministic router. Returns an existing execute() action or None."""
+    from jarvis_whatsapp_ai_call import parse_command as parse_ai_call
+    ai_call = parse_ai_call(text)
+    if ai_call:
+        return ai_call
     c = re.sub(r"\s+", " ", str(text or "").lower().strip())
     c = re.sub(r"^(?:hey\s+)?jarvis[,:\s-]*", "", c).strip()
     c = c.rstrip(" .!?,;:").strip()
@@ -1713,9 +1740,9 @@ def ask_for_confirmation(prompt):
     live_hud_state("LISTENING")
     live_hud_message("WAITING FOR APPROVAL")
     answer = listen_silence(
-        max_seconds=5,
-        start_timeout=1.8,
-        silence_after=0.8,
+        max_seconds=12,
+        start_timeout=7.0,
+        silence_after=1.2,
         sleep_mode=False,
     )
     normalized = re.sub(r"[^a-z0-9\s]", " ", str(answer).lower())
@@ -1723,6 +1750,7 @@ def ask_for_confirmation(prompt):
     return normalized in {
         "yes", "yeah", "yep", "haan", "han", "ha",
         "confirm", "confirmed", "do it", "send it",
+        "yes call", "yes call boss", "yes please", "haan call karo", "call karo",
     }
 
 def _safe_target_path(target):
@@ -1860,6 +1888,30 @@ def execute(result):
         return True, False
 
     action = str(result.get("action", "") or "").strip().lower()
+
+    if action in {"whatsapp_ai_call", "whatsapp_ai_end"}:
+        global _whatsapp_ai_controller, _whatsapp_ai_identity_confirmed
+        from jarvis_whatsapp_ai_call import CallController
+        if action == "whatsapp_ai_end":
+            if _whatsapp_ai_controller is not None:
+                _whatsapp_ai_controller.end()
+            return True, False
+        if _whatsapp_ai_controller is not None and _whatsapp_ai_controller.active:
+            return True, False
+        if not _whatsapp_ai_identity_confirmed:
+            _whatsapp_ai_identity_confirmed = ask_for_confirmation(
+                "Boss, confirm karo: Edge ka WhatsApp account, boss wale phone account se alag hai?"
+            )
+        if not _whatsapp_ai_identity_confirmed:
+            return True, False
+        _whatsapp_ai_controller = CallController(agent=whatsapp_agent)
+        # Synchronous lifecycle preserves Playwright thread ownership and pauses
+        # the ordinary microphone/desktop action router until the call ends.
+        ok, detail = _whatsapp_ai_controller.run(identity_confirmed=True)
+        print("[AI CALL RESULT]", ok, detail, flush=True)
+        live_hud_state("IDLE")
+        return True, False
+
 
     # ============================================================
     # PURE STUDY MODE
@@ -2671,7 +2723,14 @@ The feedback should be concise Roman Urdu/Hinglish, explain the reason, and incl
                 if not whatsapp_agent.start():
                     speak("Boss, WhatsApp Web se connect nahi ho paaya. Edge mein login check karo.")
                     return True, False
-                _wa_ok, _wa_detail = perform_call(whatsapp_agent, _wa_name, _wa_video)
+                if _wa_name.strip().casefold() == "boss" and not _wa_video:
+                    # The confirmed natural-language "call boss" command must
+                    # run the full AI call lifecycle, not just click Call.
+                    from jarvis_whatsapp_ai_call import CallController
+                    _wa_controller = CallController(agent=whatsapp_agent)
+                    _wa_ok, _wa_detail = _wa_controller.run(identity_confirmed=True)
+                else:
+                    _wa_ok, _wa_detail = perform_call(whatsapp_agent, _wa_name, _wa_video)
             elif action == "whatsapp_read_receipts":
                 if not whatsapp_agent.start():
                     speak("Boss, WhatsApp Web se connect nahi ho paaya.")
@@ -2746,6 +2805,25 @@ The feedback should be concise Roman Urdu/Hinglish, explain the reason, and incl
         return True, False
 
 
+    if action == "chat_mode":
+        active = bool(result.get("active"))
+        try:
+            success, message = (
+                open_chat_workspace() if active else close_chat_workspace()
+            )
+        except Exception as error:
+            success = False
+            message = f"JARVIS Chat Workspace action failed ({type(error).__name__}: {error})."
+        live_hud_activity(
+            "CHAT WORKSPACE // Ready" if success and active
+            else "CHAT WORKSPACE // Closed" if success
+            else "CHAT WORKSPACE // Failed"
+        )
+        live_hud_message(message)
+        live_hud_result("chat_mode", bool(success), message)
+        speak(message)
+        return True, False
+
     if action == "open_chatgpt":
         try:
             from windows_control import launch_chatgpt_classic
@@ -2808,17 +2886,17 @@ The feedback should be concise Roman Urdu/Hinglish, explain the reason, and incl
                 speak("Boss, website kis cheez ki banani hai?")
                 return True, False
 
-            live_hud_command(f"build website: {prompt}")
-            live_hud_activity("CODING AGENT // Building production website")
-            live_hud_message("WEBSITE BUILD STARTED // This can take a few minutes for a polished result.")
-            speak("Theek hai Boss. Production website bana raha hoon. Thoda time lagega, lekin final files validate karke dunga.")
+            live_hud_command(f"coding task: {prompt}")
+            live_hud_activity("CODING AGENT // Preserving requirements and preparing implementation")
+            live_hud_message("CODING TASK STARTED // The full request is being checked against the generated project.")
+            speak("Theek hai Boss. Coding task shuru kar raha hoon. Requirements, build aur available browser checks verify honge.")
 
             success, message = build_website(prompt)
 
             print(f"Ã°Å¸â€™Â» {message}", flush=True)
-            live_hud_activity("CODING AGENT // Website build finished")
+            live_hud_activity("CODING AGENT // Task verified" if success else "CODING AGENT // Task failed verification")
             live_hud_message(str(message))
-            speak(message)
+            speak(message if success else f"Boss, coding task verify nahi hua. {message}")
 
         except Exception as error:
             print(f"Ã¢ÂÅ’ Website coding error: {error}", flush=True)
@@ -3156,9 +3234,44 @@ def _tts_text(text):
     return value
 
 
+# JARVIS_OFFLINE_TTS_FALLBACK_V1
+def _jarvis_windows_offline_speak(text):
+    import subprocess
+
+    if not text:
+        return True
+
+    script = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$v = New-Object System.Speech.Synthesis.SpeechSynthesizer; ""$v.SelectVoice('Microsoft Zira Desktop'); "
+        "try { $v.Speak([Console]::In.ReadToEnd()) } "
+        "finally { $v.Dispose() }"
+    )
+
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        input=str(text),
+        text=True,
+        capture_output=True,
+        timeout=90,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+
+    return True
+
+
 def speak(text):
-    # HUD receives the original text; TTS receives a clean text-only version.
     clean_text = _tts_text(text)
+
     try:
         live_hud_state("SPEAKING")
         if text:
@@ -3168,18 +3281,30 @@ def speak(text):
         pass
 
     try:
+        if not clean_text:
+            return None
+
         print("[TTS] Preparing voice...", flush=True)
-        result = _voice_speak(clean_text)
-        print("[TTS] Finished.", flush=True)
-        return result
+
+        try:
+            result = _voice_speak(clean_text)
+            print("[TTS] Primary voice finished.", flush=True)
+            return result
+        except Exception as error:
+            print(f"[TTS] Primary voice failed: {error}", flush=True)
+            print("[TTS] Cartesia unavailable; Windows voice is disabled.", flush=True)
+            return None
+
     except Exception as error:
-        print(f"[TTS] Voice error recovered: {error}", flush=True)
+        print(f"[TTS] Both voice paths failed: {error}", flush=True)
         return None
+
     finally:
         try:
             live_hud_state("IDLE")
         except Exception:
             pass
+
 
 
 def run_hud_startup():
@@ -3280,6 +3405,25 @@ def _warm_fast_brain():
 
 def main():
 
+
+    # Keep legacy symbols/emojis in the console banner from terminating the
+    # assistant on Windows terminals that use a restricted code page.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    # Start the existing full-screen workspace and local-brain gateway from
+    # the same project folder that launched this Tahrun.py process.
+    try:
+        workspace_status = start_chat_workspace_services()
+        if workspace_status.get("ok"):
+            print("[JARVIS STARTUP] Chat Workspace frontend and local gateway are healthy.", flush=True)
+        else:
+            print(f"[JARVIS STARTUP] Chat Workspace unavailable: {workspace_status.get('message')}", flush=True)
+    except Exception as error:
+        print(f"[JARVIS STARTUP] Chat Workspace unavailable: {type(error).__name__}: {error}", flush=True)
 
     # JARVIS_HUD_SERVER_STARTED
     threading.Thread(target=_live_telemetry_loop, daemon=True).start()
@@ -3510,9 +3654,13 @@ def main():
             _direct_command = re.sub(r"\byoutubeopen\b", "youtube open", _direct_command)
             _direct_command = re.sub(r"\s+", " ", _direct_command).strip()
 
-            _screen_route = _jarvis_route_screen_command(command)
+            _chat_mode_route = _detect_chat_mode_command(command)
+            _screen_route = None if _chat_mode_route is not None else _jarvis_route_screen_command(command)
             _pending_quiz_route = None if _screen_route is not None else _jarvis_route_pending_quiz(command)
-            if _screen_route is not None:
+            if _chat_mode_route is not None:
+                result = _chat_mode_route
+                print(f"[CHAT MODE FASTPATH] {result}", flush=True)
+            elif _screen_route is not None:
                 result = _screen_route
                 print(f"[SCREEN FASTPATH] {result}", flush=True)
             elif _pending_quiz_route is not None:
@@ -3526,9 +3674,9 @@ def main():
             }:
                 result = {"action": "open_website", "target": "youtube"}
                 print("Ã¢â€“Â¶Ã¯Â¸Â Direct YouTube open command detected", flush=True)
-            elif _looks_like_website_build_request(command):
+            elif _looks_like_coding_task_request(command):
                 result = {"action": "build_website", "target": command}
-                print("Ã°Å¸â€™Â» Website build command detected Ã¢â‚¬â€ routing directly to Coding Agent", flush=True)
+                print("Ã°Å¸â€™Â» Software build command detected — routing to Coding Agent", flush=True)
             elif detect_open_chatgpt_command(command):
                 result = {"action": "open_chatgpt", "target": "chatgpt"}
                 print("ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ ChatGPT Classic open command detected", flush=True)
@@ -3586,11 +3734,13 @@ def main():
                 flush=True,
             )
 
-            live_hud_result(action_name, bool(running), "Command execution completed")
+            if result.get("action") != "chat_mode":
+                live_hud_result(action_name, bool(running), "Command execution completed")
             live_hud_state("IDLE")
 
 
-            hud_send("RESULT", message="Execution finished", action=result.get("action"))
+            if result.get("action") != "chat_mode":
+                hud_send("RESULT", message="Execution finished", action=result.get("action"))
             _jarvis_local_live_hud_state("idle")
 
             # Stay continuously active until an explicit standby command.
