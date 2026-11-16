@@ -295,16 +295,23 @@ class AudioBridge:
 
     def select_devices(self):
         self.output = self._cable_output(self.p)
-        loopbacks = [d for d in self.p.get_loopback_device_info_generator()
-                     if 'cable' not in d['name'].lower()]
-        preferred = os.getenv('JARVIS_CALL_LOOPBACK', 'Headphones (2- Airdopes 212) [Loopback]')
-        matches = [d for d in loopbacks if d['name'] == preferred]
-        if not matches:
-            # Follow the default render endpoint only; do not silently pick arbitrary speakers.
-            default = self.p.get_default_wasapi_loopback()
-            matches = [d for d in loopbacks if d['index'] == default['index']]
+        loopbacks = list(self.p.get_loopback_device_info_generator())
+        # The verified WhatsApp *speaker* in this setup is VB-CABLE Input.
+        # Capturing the Airdopes loopback instead hears silence, which caused
+        # LISTENING to repeat forever without hearing the person on the phone.
+        # An override is allowed for a future setup with a separate speaker.
+        preferred = os.getenv('JARVIS_CALL_LOOPBACK', '').strip()
+        if preferred:
+            matches = [d for d in loopbacks if d['name'].casefold() == preferred.casefold()]
+        else:
+            matches = [d for d in loopbacks
+                       if 'cable input' in d['name'].lower()
+                       and '16ch' not in d['name'].lower()]
         if len(matches) != 1:
-            raise CallError('Incoming WASAPI loopback unavailable; check WhatsApp output.')
+            names = ', '.join(d['name'] for d in loopbacks)
+            raise CallError('WhatsApp speaker loopback not uniquely found. '
+                            'Select CABLE Input in WhatsApp, set JARVIS_CALL_LOOPBACK '
+                            'to the exact WASAPI loopback device name. Available: ' + names[:300])
         self.incoming = matches[0]
         print('[AI CALL] Incoming:', self.incoming['name'], '| Outgoing: CABLE Input', flush=True)
 
@@ -390,8 +397,10 @@ class AudioBridge:
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=2)
-        # Capture stream is closed during playback. A fresh stream after this
-        # guard discards local buffering/short remote echo instead of transcribing it.
+        # The same physical VB-CABLE endpoint is currently used for playback
+        # and WhatsApp's speaker. Pausing capture during playback and then
+        # reopening after this guard reduces JARVIS transcribing its own voice.
+        # A dedicated second virtual cable is recommended for true isolation.
         stop.wait(.6)
 
     def close(self):
@@ -467,6 +476,7 @@ class CallController:
         self._owns_agent = agent is None
         self._unknown_since = None
         self._intro_audio = None
+        self._filler_audio = None
 
     def transition(self, state):
         self.state = state
@@ -532,6 +542,42 @@ class CallController:
             path.write_bytes(data)
             self.audio.play(path, self.stop, self.tick)
 
+    def think_and_say(self, text):
+        """Start the next natural reply promptly; never insert artificial silence.
+
+        If the model is still thinking at 1.35 seconds, play one pre-rendered
+        acknowledgement on the call's TTS route. Always speak the real answer
+        afterwards. Keep all WhatsApp DOM checks on the owning thread.
+        """
+        results = queue.Queue(maxsize=1)
+
+        def generate():
+            try:
+                results.put((True, self.brain.reply(text)))
+            except Exception as exc:
+                results.put((False, exc))
+
+        worker = threading.Thread(target=generate, name='JARVIS-call-brain', daemon=True)
+        worker.start()
+        started = time.monotonic()
+        filler_played = False
+        while worker.is_alive():
+            self.tick()
+            elapsed = time.monotonic() - started
+            if elapsed >= 30:
+                raise CallError('AI reply timed out; end call to retry safely.')
+            if (not filler_played and elapsed >= 1.35
+                    and self._filler_audio is not None):
+                filler_played = True
+                if worker.is_alive():
+                    self.say('Hmm Boss, ek second.', prepared=self._filler_audio)
+            worker.join(.08)
+        ok, answer = results.get_nowait()
+        if not ok:
+            raise answer
+        self.tick()
+        self.say(answer or 'Boss, dobara bolo.')
+
     def run(self, identity_confirmed=False):
         if not self._exclusive.acquire(blocking=False):
             return False, 'A call is already active.'
@@ -566,6 +612,12 @@ class CallController:
             introduction = 'Hello boss! Main JARVIS hoon, aapka AI assistant. Batao, kya haal hai?'
             # Fail before calling if the key, credits, voice or TTS network is unavailable.
             self._intro_audio = self.render(introduction)
+            # Reuse this short WAV for delayed thoughts: never make the phone
+            # wait for Cartesia to synthesize an acknowledgement on the fly.
+            try:
+                self._filler_audio = self.render('Hmm Boss, ek second.')
+            except Exception:
+                self._filler_audio = None
             self.transition(State.DIALING)
             if self.dial is None:
                 from jarvis_whatsapp_controls import perform_call
@@ -609,9 +661,9 @@ class CallController:
                 if parse_command(text) == {'action': 'whatsapp_ai_end'}:
                     self.end()
                     break
+                self.status('HEARD: ' + spoken_text(text)[:110])
                 self.transition(State.THINKING)
-                reply = self.work(lambda: self.brain.reply(text))
-                self.say(reply)
+                self.think_and_say(text)
             return self.connected, 'Call ended.'
         except InterruptedError:
             return self.connected, 'Call ended.'
@@ -640,7 +692,7 @@ class CallController:
                     if self._owns_agent and self.agent:
                         self.agent.close()
                 finally:
-                    self.audio = self.ui = self.brain = self._intro_audio = None
+                    self.audio = self.ui = self.brain = self._intro_audio = self._filler_audio = None
                     self.active = False
                     process_lock.release()
                     self._exclusive.release()
