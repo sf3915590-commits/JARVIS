@@ -8,7 +8,8 @@ from jarvis_whatsapp_ai_call import parse_command
 class CallToolClassifierTests(unittest.TestCase):
     def test_hangup_variants(self):
         for phrase in ("Jarvis, cut the call.", "Cut the call.", "Hang up",
-                       "call band karo", "call cut kar do", "end this call"):
+                       "call band karo", "call cut kar do", "end this call",
+                       "Please cut the call", "Jarvis cut the call please"):
             with self.subTest(phrase=phrase):
                 self.assertTrue(call_hangup_command(phrase))
                 self.assertEqual(parse_command(phrase), {"action": "whatsapp_ai_end"})
@@ -21,7 +22,9 @@ class CallToolClassifierTests(unittest.TestCase):
 
     def test_open_chrome(self):
         for phrase in ("Open Chrome", "Jarvis, open Chrome", "Chrome open karo",
-                       "chrome khol do", "launch Google Chrome"):
+                       "chrome khol do", "launch Google Chrome",
+                       "Jarvis could you open Chrome please",
+                       "Now open Chrome"):
             with self.subTest(phrase=phrase):
                 self.assertEqual(classify(phrase), ("app", "chrome"))
 
@@ -39,6 +42,7 @@ class CallToolClassifierTests(unittest.TestCase):
 
     def test_time_and_news_intents(self):
         self.assertEqual(classify("What is the time now?"), ("time", ""))
+        self.assertEqual(classify("Please tell me the exact time now"), ("time", ""))
         self.assertEqual(classify("Aaj ki date batao"), ("date", ""))
         self.assertEqual(classify("Latest news")[0], "news")
         self.assertEqual(classify("Search the web for Mars launch")[0], "search")
