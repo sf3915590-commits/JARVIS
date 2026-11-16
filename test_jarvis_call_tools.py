@@ -48,6 +48,25 @@ class CallToolClassifierTests(unittest.TestCase):
         self.assertEqual(classify("Search the web for Mars launch")[0], "search")
 
 
+class CallBrainDispatchTests(unittest.TestCase):
+    def test_open_app_routes_to_real_tool_without_model_hallucination(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from jarvis_whatsapp_ai_call import CallBrain
+        calls = []
+        fake_model = SimpleNamespace(chat=lambda **kw: self.fail('model should not execute app action'))
+        with patch.dict(sys.modules, {
+            'ollama': SimpleNamespace(Client=lambda **kw: fake_model)
+        }):
+            brain = CallBrain(tools=CallTools(
+                app_launcher=lambda name: (calls.append(name) or True, 'ok')
+            ))
+        reply = brain.reply('Jarvis, open Chrome')
+        self.assertEqual(calls, ['chrome'])
+        self.assertIn('open kar diya', reply)
+
+
 class ToolExecutionTests(unittest.TestCase):
     def setUp(self):
         self.apps = []
