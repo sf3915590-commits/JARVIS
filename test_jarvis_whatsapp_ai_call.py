@@ -68,6 +68,36 @@ class ThoughtTests(unittest.TestCase):
         with self.assertRaises(CallError):
             controller.tick()
 
+    def test_ack_is_played_before_transcription_finishes(self):
+        done = []
+        said = []
+        def slow_transcription(_audio):
+            time.sleep(.18)
+            done.append('transcribed')
+            return 'Aaj ka plan kya hai?'
+        controller = CallController(
+            agent=object(),
+            audio=SimpleNamespace(transcribe=slow_transcription),
+            status=lambda *_: None,
+        )
+        controller.tick = lambda: None
+        controller._filler_audio = b'cached'
+        controller.say = lambda message, prepared=None: said.append(
+            (message, prepared, list(done))
+        )
+        spoken = controller.transcribe_with_ack(b'input audio')
+        self.assertEqual(spoken, 'Aaj ka plan kya hai?')
+        self.assertEqual(said[0][0], 'Hmm, abhi dekhti hoon.')
+        self.assertEqual(said[0][1], b'cached')
+        self.assertEqual(said[0][2], [])
+
+    def test_ai_reply_does_not_repeat_filler(self):
+        controller, said = self.make_controller(
+            SimpleNamespace(reply=lambda text: 'Ji boss, chalte hain')
+        )
+        controller.think_and_say('Plan batao')
+        self.assertEqual(said, [('Ji boss, chalte hain', None)])
+
     def test_fast_answer_has_no_filler(self):
         c, said = self.make_controller(SimpleNamespace(reply=lambda text: "Hi Boss"))
         c.think_and_say("Hello")
