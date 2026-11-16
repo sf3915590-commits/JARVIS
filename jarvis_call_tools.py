@@ -85,6 +85,8 @@ def classify(text):
     target = prefix.group(1).strip() if prefix else suffix.group(1).strip() if suffix else ""
     if target:
         target = re.sub(r"^(?:my|the)\s+", "", target)
+        if target.endswith(" folder"):
+            target = target[:-7].strip()
         if target in FOLDERS:
             return ("folder", target)
         if target in SITES:
