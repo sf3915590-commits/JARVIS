@@ -43,6 +43,31 @@ class ThoughtTests(unittest.TestCase):
         c.say = lambda text, prepared=None: said.append((text, prepared))
         return c, said
 
+    def test_transient_whatsapp_ui_timeout_is_diagnostic_not_fatal(self):
+        messages = []
+        controller = CallController(
+            agent=object(),
+            ui=SimpleNamespace(sample=lambda: (_ for _ in ()).throw(TimeoutError())),
+            status=messages.append,
+        )
+        controller.dialed = True
+        controller.connected = True
+        controller.tick()  # one flaky DOM read should not kill a connected call
+        self.assertTrue(any("probe timed out" in line for line in messages))
+
+    def test_repeated_unverified_ui_times_out_closed(self):
+        from jarvis_whatsapp_ai_call import CallError
+        controller = CallController(
+            agent=object(),
+            ui=SimpleNamespace(sample=lambda: (_ for _ in ()).throw(TimeoutError())),
+            status=lambda *_: None,
+        )
+        controller.dialed = True
+        controller.connected = True
+        controller._unknown_since = time.monotonic() - 4
+        with self.assertRaises(CallError):
+            controller.tick()
+
     def test_fast_answer_has_no_filler(self):
         c, said = self.make_controller(SimpleNamespace(reply=lambda text: "Hi Boss"))
         c.think_and_say("Hello")
