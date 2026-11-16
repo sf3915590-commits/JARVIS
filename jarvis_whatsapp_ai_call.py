@@ -211,7 +211,10 @@ class EndpointVAD:
         self.frames = []
         self.run = 0
         self.silence = 0
-        self.noise = .001
+        self.noise = .0005
+        self.last_rms = 0.0
+        self.last_ratio = 0.0
+        self.detected_speech_frames = 0
 
     def feed(self, frame):
         import numpy as np
@@ -219,7 +222,14 @@ class EndpointVAD:
         spectrum = np.abs(np.fft.rfft(frame))
         freq = np.fft.rfftfreq(len(frame), 1 / self.rate)
         ratio = float(spectrum[(freq >= 200) & (freq <= 4000)].sum() / (spectrum.sum() + 1e-9))
-        speech = rms > max(.004, self.noise * 3) and ratio > .30
+        # WhatsApp's incoming voice is often quiet after VB-CABLE mixing.
+        # Do not require desktop-microphone loudness from a digital loopback.
+        # Dynamic floor + spectral check still help reject idle cable noise.
+        self.last_rms = rms
+        self.last_ratio = ratio
+        speech = rms > max(.0014, self.noise * 2.5) and ratio > .22
+        if speech:
+            self.detected_speech_frames += 1
         if not self.frames:
             self.pre.append(frame)
             self.run = self.run + 1 if speech else 0
@@ -327,7 +337,7 @@ class AudioBridge:
                             frames_per_buffer=rate // 50, start=False)
         probe.close()
 
-    def capture(self, stop, tick):
+    def capture(self, stop, tick, report=None):
         import numpy as np
         from scipy.signal import resample_poly
         if self.p is None:
@@ -348,6 +358,11 @@ class AudioBridge:
                                   frames_per_buffer=size)
         started = time.monotonic()
         last_tick = 0
+        next_audio_report = started + 4.0
+        peak_rms = 0.0
+        observed_blocks = 0
+        speech_blocks = 0
+        report = report or (lambda message: print('[AI CALL AUDIO]', message, flush=True))
         try:
             while not stop.is_set() and time.monotonic() - started < 25:
                 now = time.monotonic()
@@ -360,8 +375,23 @@ class AudioBridge:
                 raw = self.stream.read(size, exception_on_overflow=False)
                 frame = np.frombuffer(raw, dtype=np.int16).astype(np.float32).reshape(-1, channels).mean(axis=1) / 32768
                 utterance = vad.feed(frame)
+                observed_blocks += 1
+                peak_rms = max(peak_rms, vad.last_rms)
+                if vad.last_rms > .0014 and vad.last_ratio > .22:
+                    speech_blocks += 1
+                if now >= next_audio_report:
+                    # Levels only: do not log/save call audio or transcriptions.
+                    report(f'Input meter peak={peak_rms:.4f} '
+                           f'speech_frames={speech_blocks}/{observed_blocks}; '
+                           f'VAD_active={bool(vad.frames)}')
+                    next_audio_report = now + 4.0
+                    peak_rms = 0.0
+                    observed_blocks = 0
+                    speech_blocks = 0
                 if utterance is not None:
+                    report(f'Utterance captured ({len(utterance) / rate:.2f}s).')
                     return resample_poly(utterance, 16000, rate).astype(np.float32)
+            report('No complete voice utterance in 25s; listening again.')
             return None
         finally:
             self.stream.stop_stream()
@@ -475,6 +505,7 @@ class CallController:
         self.last_error = ''
         self._owns_agent = agent is None
         self._unknown_since = None
+        self._stage = 'idle'
         self._intro_audio = None
         self._filler_audio = None
 
@@ -493,7 +524,19 @@ class CallController:
         if self.stop.is_set():
             raise InterruptedError()
         if self.dialed:
-            state = self.ui.sample()
+            try:
+                state = self.ui.sample()
+            except Exception as exc:
+                # A dynamic WhatsApp call panel may time out during a DOM
+                # repaint. One transient failure is not proof of hangup.
+                # Repeated failures still hit the conservative unknown timer.
+                if type(exc).__name__ == 'TimeoutError':
+                    state = 'unknown'
+                    if getattr(self, '_last_ui_timeout_log', 0) + 2 < time.monotonic():
+                        self.status('Call UI probe timed out; verifying again.')
+                        self._last_ui_timeout_log = time.monotonic()
+                else:
+                    raise
             if state == 'ended':
                 raise InterruptedError()
             if self.connected and state != 'connected':
@@ -647,14 +690,26 @@ class CallController:
             if not self.connected:
                 raise CallError('Answer not verified before timeout (' + str(getattr(self.ui, 'last_probe', 'call UI unavailable')) + '); no AI audio sent.')
             self.transition(State.CONNECTED)
+            self._stage = 'playing initial greeting'
             self.say(introduction, prepared=self._intro_audio)
             self._intro_audio = None
             while not self.stop.is_set():
+                self._stage = 'checking call before listen'
                 self.tick()
                 self.transition(State.LISTENING)
-                audio = self.audio.capture(self.stop, self.tick)
+                self._stage = 'capturing remote WhatsApp speech'
+                # Hook the audio meter into the existing logger. Tests with
+                # older fake audio bridges remain compatible.
+                try:
+                    audio = self.audio.capture(self.stop, self.tick, report=self.status)
+                except TypeError as exc:
+                    if "report" not in str(exc):
+                        raise
+                    audio = self.audio.capture(self.stop, self.tick)
                 if audio is None:
                     continue
+                self._stage = 'transcribing inbound speech'
+                self.status('Audio captured; transcribing.')
                 text = self.work(lambda: self.audio.transcribe(audio), timeout=60)
                 if not text:
                     continue
@@ -663,12 +718,21 @@ class CallController:
                     break
                 self.status('HEARD: ' + spoken_text(text)[:110])
                 self.transition(State.THINKING)
+                self._stage = 'generating and playing reply'
                 self.think_and_say(text)
             return self.connected, 'Call ended.'
         except InterruptedError:
             return self.connected, 'Call ended.'
         except Exception as exc:
-            # Only our own controlled messages are displayed. Third-party errors may contain secrets.
+            # Never log raw exception messages that may expose credentials.
+            # Stage + source filename/line identify a transient WhatsApp DOM
+            # timeout versus PortAudio/STT without sharing any call content.
+            import traceback
+            frames = traceback.extract_tb(exc.__traceback__)
+            origin = frames[-1] if frames else None
+            where = (f'{Path(origin.filename).name}:{origin.lineno}:{origin.name}'
+                     if origin is not None else 'unknown')
+            self.status('Failure stage=' + self._stage + ', at=' + where)
             self.last_error = str(exc) if isinstance(exc, CallError) else type(exc).__name__
             self.transition(State.ERROR)
             self.status(self.last_error)
