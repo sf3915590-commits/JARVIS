@@ -5,6 +5,8 @@ on:
     paths:
       - "jarvis_whatsapp_ai_call.py"
       - "test_jarvis_whatsapp_ai_call.py"
+      - "jarvis_call_tools.py"
+      - "test_jarvis_call_tools.py"
       - ".github/workflows/test-whatsapp-ai-call.yml"
   workflow_dispatch:
 
@@ -17,6 +19,6 @@ jobs:
         with:
           python-version: "3.11"
       - name: Validate syntax without requiring Windows audio drivers
-        run: python -m py_compile jarvis_whatsapp_ai_call.py test_jarvis_whatsapp_ai_call.py
-      - name: Run isolated call tests
-        run: python -m unittest -v test_jarvis_whatsapp_ai_call.py
+        run: python -m py_compile jarvis_whatsapp_ai_call.py jarvis_call_tools.py test_jarvis_whatsapp_ai_call.py test_jarvis_call_tools.py
+      - name: Run isolated call and desktop-tool tests
+        run: python -m unittest -v test_jarvis_whatsapp_ai_call.py test_jarvis_call_tools.py
