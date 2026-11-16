@@ -1,0 +1,20 @@
+name: Continuous call unit tests
+
+on:
+  pull_request:
+    paths:
+      - "jarvis_call_conversation.py"
+      - "test_jarvis_call_conversation.py"
+      - ".github/workflows/test-continuous-call.yml"
+  workflow_dispatch:
+
+jobs:
+  test-call-session:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify continuous-call loop
+        run: python -m unittest -v test_jarvis_call_conversation.py
