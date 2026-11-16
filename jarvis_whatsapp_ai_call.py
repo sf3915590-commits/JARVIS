@@ -198,15 +198,29 @@ class CallUI:
             if button.count() == 1 and button.is_visible():
                 button.click(timeout=1500)
                 return True
-        # Unknown call layout: cleanup only, never infer connection from this.
-        # Keep the same exact contact/header gate used for initiating the call.
+        # Unknown call layout: never click an unrelated button. Only allow
+        # fallback in the original verified lowercase boss conversation.
         page = self.agent.page
         header = page.locator('[data-testid="conversation-info-header-chat-title"]')
+        if not (header.count() == 1 and
+                header.inner_text(timeout=1000).strip() == 'boss'):
+            return False
         button = page.get_by_role('button', name=self.END)
-        if (header.count() == 1 and header.inner_text(timeout=1000).strip() == 'boss'
-                and button.count() == 1 and button.is_visible()):
+        if button.count() == 1 and button.is_visible():
             button.click(timeout=1500)
             return True
+        # WhatsApp Web also offers Ctrl+Alt+W for "End call" in its
+        # accessibility shortcut layer. Restrict the fallback to a previously
+        # *confirmed* active call, never an arbitrary chat with the same name.
+        if self.confirmed and self.ever_visible and self.has_calls:
+            try:
+                page.keyboard.press('Control+Alt+W')
+                time.sleep(.25)
+                observed = self.sample()
+                if observed == 'ended' or not self.has_calls:
+                    return True
+            except Exception:
+                pass
         return False
 
 
