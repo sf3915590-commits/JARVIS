@@ -81,7 +81,7 @@ def classify(text):
         return ("news", (topic[:90] + " latest news") if topic else "India world latest news")
 
     # Natural polite voice commands work as well as terse "Open Chrome".
-    open_text = re.sub(r"^(?:can you|could you|would you|zara|please)\s+",
+    open_text = re.sub(r"^(?:can you|could you|would you|now|zara|please)\s+",
                        "", t).strip()
     open_text = re.sub(r"\s+(?:please|now|zara)$", "", open_text).strip()
     # Only explicit named targets get privileged desktop operations.
