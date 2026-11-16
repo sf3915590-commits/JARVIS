@@ -298,6 +298,7 @@ class AudioBridge:
         self.incoming = None
         self.stream = None
         self.model = None
+        self._groq_disabled = False
 
     @staticmethod
     def _cable_output(audio):
@@ -409,10 +410,81 @@ class AudioBridge:
             self.stream.close()
             self.stream = None
 
+    @staticmethod
+    def _groq_key():
+        key = os.environ.get('GROQ_API_KEY', '').strip()
+        if key:
+            return key
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment') as registry:
+                key = str(winreg.QueryValueEx(registry, 'GROQ_API_KEY')[0]).strip()
+                if key:
+                    return key
+        except (ImportError, OSError):
+            pass
+        try:
+            from dotenv import dotenv_values
+            key = str(dotenv_values(Path(__file__).resolve().parent / '.env',
+                                    interpolate=False).get('GROQ_API_KEY') or '').strip()
+        except ImportError:
+            key = ''
+        return key
+
     def transcribe(self, audio):
-        segments, _ = self.model.transcribe(audio, language=None, beam_size=3,
-                                             vad_filter=True, condition_on_previous_text=False)
-        return ' '.join(s.text.strip() for s in segments if s.no_speech_prob < .7).strip()
+        """Reuse main JARVIS's Groq Whisper when configured, with local fallback.
+
+        Speech goes to Groq only when GROQ_API_KEY is configured and the
+        caller has not opted out with JARVIS_CALL_STT=local.
+        """
+        provider = os.getenv('JARVIS_CALL_STT', 'auto').lower().strip()
+        if provider not in {'auto', 'groq', 'local'}:
+            provider = 'local'
+        if provider != 'local' and not self._groq_disabled:
+            key = self._groq_key()
+            if key:
+                try:
+                    import io
+                    import numpy as np
+                    from groq import Groq
+                    buffer = io.BytesIO()
+                    pcm = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+                    with wave.open(buffer, 'wb') as wav:
+                        wav.setnchannels(1)
+                        wav.setsampwidth(2)
+                        wav.setframerate(16000)
+                        wav.writeframes(pcm.tobytes())
+                    buffer.seek(0)
+                    buffer.name = 'jarvis_call.wav'
+                    result = Groq(api_key=key, timeout=12).audio.transcriptions.create(
+                        file=buffer, model='whisper-large-v3',
+                        response_format='text', temperature=0,
+                        prompt=('Transcribe only the actual words spoken. '
+                                'Use Latin letters for Roman Urdu/Hinglish if possible. '
+                                'Vocabulary: JARVIS, Chrome, WhatsApp, VS Code, '
+                                'features, time, latest news, cut the call.'),
+                    )
+                    value = str(result or '').strip()
+                    if value:
+                        print('[AI CALL STT] Groq Whisper Large V3.', flush=True)
+                        return value
+                except Exception as exc:
+                    # Keep keys/error messages out of logs; don't keep retrying
+                    # a failing provider on every turn in the same phone call.
+                    self._groq_disabled = True
+                    print('[AI CALL STT] Groq unavailable (' +
+                          type(exc).__name__ + '); local fallback.', flush=True)
+        segments, _ = self.model.transcribe(
+            audio, language=None, beam_size=2, temperature=0,
+            initial_prompt=('JARVIS, Chrome, WhatsApp, open Chrome, '
+                            'VS Code, cut the call, latest news, time, features.'),
+            vad_filter=True, condition_on_previous_text=False)
+        text = ' '.join(s.text.strip() for s in segments if s.no_speech_prob < .7).strip()
+        if text.lower().rstrip(' .!?') in {'thank you for watching',
+                                          'subtitles by the amara org community'}:
+            return ''
+        print('[AI CALL STT] Local Whisper.', flush=True)
+        return text
 
     def play(self, path, stop, tick):
         flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
