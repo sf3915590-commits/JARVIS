@@ -22,3 +22,4 @@ sounddevice
 websocket-client
 websockets
 yt-dlp
+Unidecode
