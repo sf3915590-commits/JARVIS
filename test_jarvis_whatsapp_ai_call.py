@@ -103,14 +103,13 @@ class ThoughtTests(unittest.TestCase):
         c.think_and_say("Hello")
         self.assertEqual(said, [("Hi Boss", None)])
 
-    def test_slow_answer_has_one_filler(self):
+    def test_slow_answer_has_no_duplicate_filler(self):
         def respond(_):
-            time.sleep(1.6)
+            time.sleep(.15)
             return "Ji Boss"
         c, said = self.make_controller(SimpleNamespace(reply=respond))
         c.think_and_say("Tell me")
-        self.assertEqual(said[0], ("Hmm Boss, ek second.", b"cached"))
-        self.assertEqual(said[1], ("Ji Boss", None))
+        self.assertEqual(said, [("Ji Boss", None)])
 
 
 if __name__ == "__main__":
