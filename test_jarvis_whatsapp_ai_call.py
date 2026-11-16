@@ -87,7 +87,7 @@ class ThoughtTests(unittest.TestCase):
         )
         spoken = controller.transcribe_with_ack(b'input audio')
         self.assertEqual(spoken, 'Aaj ka plan kya hai?')
-        self.assertEqual(said[0][0], 'Hmm, abhi dekhti hoon.')
+        self.assertEqual(said[0][0], 'Ji Boss, ek second.')
         self.assertEqual(said[0][1], b'cached')
         self.assertEqual(said[0][2], [])
 
