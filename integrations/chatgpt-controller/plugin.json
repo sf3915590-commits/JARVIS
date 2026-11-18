@@ -1,0 +1,25 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "jarvis-controller",
+  "version": "0.1.0",
+  "description": "Control the existing Windows JARVIS through its local chat gateway and HUD command queue.",
+  "repository": "https://github.com/sf3915590-commits/JARVIS",
+  "author": {
+    "name": "JARVIS Project"
+  },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "JARVIS Controller",
+        "shortDescription": "Control your Windows JARVIS",
+        "longDescription": "Local MCP controller for the existing JARVIS. iPhone remote access requires a separately deployed authenticated relay.",
+        "developerName": "JARVIS Project",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive"
+        ],
+        "defaultPrompt": "Check whether my local JARVIS is running."
+      }
+    }
+  }
+}
