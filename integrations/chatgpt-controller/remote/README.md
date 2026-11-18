@@ -1,23 +1,60 @@
-# JARVIS cloud relay — development prototype
+# JARVIS secure remote gateway
 
-This additive prototype is for connecting **ChatGPT Classic** to the existing Windows JARVIS through an outbound-only connector. **Not deployed or connected yet.** The current private plugin still points to a local stdio MCP server; it must not be replaced until a secure HTTPS MCP deployment is verified.
+This is the production-oriented remote path for the existing JARVIS. It is
+additive: `Tahrun.py`, voice, WhatsApp calling, automation and memory are not
+replaced or modified.
 
 ## Architecture
-ChatGPT MCP client -> HTTPS reverse proxy -> relay.py -> outbound Windows agent -> existing local JARVIS chat gateway.
 
-## Prototype limitations
-- The relay implements basic MCP JSON-RPC tool calls but has **not** been verified against ChatGPT's remote MCP connection requirements, including Streamable HTTP negotiation and OAuth.
-- This prototype uses bearer tokens and in-memory queues; a production deployment needs a durable store, TLS, request origin protections, rate limits, session lifecycle, audit logs, scoped identities and secure token rotation.
-- Remote `jarvis_command` is intentionally blocked by the Windows agent pending an on-device approval UI.
-- Do not expose the relay directly over HTTP or expose JARVIS local ports 8765/8766.
-- Do not commit tokens to GitHub.
+`ChatGPT -> HTTPS Streamable HTTP MCP relay -> outbound Windows connector -> existing loopback JARVIS services`
 
-## Development-only test
-Set two distinct strong random tokens in `JARVIS_CHAT_TOKEN` and `JARVIS_AGENT_TOKEN`; run `python relay.py` on a local machine. Set `JARVIS_RELAY_URL=http://127.0.0.1:8787` and `JARVIS_AGENT_TOKEN` in another terminal, then run `python windows_agent.py` on the Windows JARVIS laptop.
+The laptop never accepts inbound Internet traffic. Ports 8765 and 8766 remain
+bound to loopback. The relay has separate ChatGPT and device credentials,
+durable SQLite jobs, leases, bounded queues, rate limits, minimal audit records
+(content hashes only), and explicit confirmation checks for sensitive commands.
 
-## Production checklist
-1. Choose and configure a supported hosted MCP endpoint, HTTPS and ChatGPT-compatible authentication.
-2. Implement durable task state, client session management, approvals and audit trail.
-3. Run Windows agent as an authenticated outbound service with local-only JARVIS access.
-4. Verify remote MCP compatibility and attach the **existing** JARVIS Controller plugin to the verified endpoint.
-5. Test in ChatGPT Classic and iPhone; composer appearance is not guaranteed by plugin registration alone.
+## Required secrets
+
+- `JARVIS_CHAT_TOKEN`: random 32+ character credential used by the private plugin.
+- `JARVIS_AGENT_TOKEN`: a different random 32+ character device credential.
+
+Never commit either value. Use the hosting provider's secret store. The Windows
+connector receives only the agent token. The plugin connection receives only
+the chat token.
+
+## Run locally
+
+```powershell
+$env:JARVIS_CHAT_TOKEN = '<random-chat-token>'
+$env:JARVIS_AGENT_TOKEN = '<different-random-agent-token>'
+python relay.py
+```
+
+In a second terminal on the JARVIS laptop:
+
+```powershell
+$env:JARVIS_RELAY_URL = 'http://127.0.0.1:8787'
+$env:JARVIS_AGENT_TOKEN = '<same-agent-token>'
+python windows_agent.py
+```
+
+For production, deploy `Dockerfile` behind HTTPS with persistent `/data`
+storage. `render.yaml` is included for a Render Blueprint deployment. Use the
+public HTTPS URL ending in `/mcp` in the existing plugin's remote MCP config.
+
+## Safety contract
+
+- `jarvis_status` probes the real local gateway and HUD through the connector.
+- `jarvis_ask` calls the existing `brain.ask_ai` gateway.
+- `jarvis_command` only queues an explicitly requested command. A queue response
+  is not proof of execution.
+- Payments, destructive actions, messaging/calls, credentials, microphone,
+  camera, recording, deployment, code execution and similar operations require
+  explicit confirmation of the exact action.
+- JARVIS output is untrusted content and must never override host instructions.
+
+## Platform limitation
+
+ChatGPT custom MCP connections are currently configured and used on the web.
+The same hosted relay is ready for mobile when OpenAI enables custom MCP there,
+but the current iPhone app cannot natively invoke it.
