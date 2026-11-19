@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: jarvis-controller-relay
+    runtime: docker
+    dockerfilePath: ./integrations/chatgpt-controller/remote/Dockerfile
+    dockerContext: ./integrations/chatgpt-controller/remote
+    healthCheckPath: /healthz
+    envVars:
+      - key: JARVIS_CHAT_TOKEN
+        generateValue: true
+      - key: JARVIS_AGENT_TOKEN
+        generateValue: true
+      - key: JARVIS_RELAY_DB
+        value: /data/jarvis-relay.sqlite3
+    disk:
+      name: jarvis-relay-data
+      mountPath: /data
+      sizeGB: 1
