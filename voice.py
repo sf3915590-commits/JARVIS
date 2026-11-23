@@ -267,12 +267,16 @@ def speak(text):
         _barge_in = False
         _barge_stop = threading.Event()
 
-        detector = threading.Thread(
-            target=_detect_barge_in,
-            args=(_barge_stop,),
-            daemon=True,
-        )
-        detector.start()
+        # The current energy/spectrum detector cannot distinguish the owner's
+        # speech from video or speaker audio. Keep it opt-in until speaker
+        # verification is implemented and tested on the target microphone.
+        if os.getenv("JARVIS_UNVERIFIED_BARGE_IN", "0") == "1":
+            detector = threading.Thread(
+                target=_detect_barge_in,
+                args=(_barge_stop,),
+                daemon=True,
+            )
+            detector.start()
 
         if output_file.exists() and output_file.stat().st_size:
             print("[TTS] Playing cached Cartesia audio.", flush=True)

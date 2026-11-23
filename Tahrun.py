@@ -3468,10 +3468,8 @@ def main():
                     "Theek hai Boss. Main standby mein hoon."
                 )
 
-                _jarvis_local_hud_stop()
-                if activated_on_launch:
-                    return
-
+                # Standby must keep the main voice loop alive for the next wake word.
+                # Do not return from the assistant when activated on launch.
                 continuous_mode = False
                 standby_message_shown = False
 
