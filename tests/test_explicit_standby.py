@@ -58,6 +58,17 @@ class ExplicitStandbyTests(unittest.TestCase):
             source,
         )
 
+    def test_silence_capture_returns_at_onset_timeout(self):
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8-sig"))
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "listen_silence")
+        checks = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.If) and "block_index >= start_blocks" in ast.unparse(n.test)
+        ]
+        self.assertEqual(len(checks), 1)
+        self.assertTrue(any(isinstance(n, ast.Break) for n in checks[0].body))
+
+
 
 if __name__ == "__main__":
     unittest.main()
