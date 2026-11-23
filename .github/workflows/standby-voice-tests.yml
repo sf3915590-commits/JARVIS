@@ -1,0 +1,26 @@
+name: JARVIS standby voice regressions
+
+on:
+  push:
+    paths:
+      - "Tahrun.py"
+      - "tests/test_explicit_standby.py"
+      - ".github/workflows/standby-voice-tests.yml"
+  pull_request:
+    paths:
+      - "Tahrun.py"
+      - "tests/test_explicit_standby.py"
+      - ".github/workflows/standby-voice-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  standby-regressions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Python source and standby behavior without Windows dependencies
+        run: |
+          python -m py_compile Tahrun.py
+          python -m unittest discover -s tests -p "test_explicit_standby.py" -v
