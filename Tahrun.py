@@ -849,8 +849,10 @@ def listen_silence(
                         chunks.append(data.copy())
                         continue
 
+                    # No speech within the onset window: return promptly rather
+                    # than recording until max_seconds on every silent turn.
                     if block_index >= start_blocks and speech_run == 0:
-                        continue
+                        break
 
                 else:
                     chunks.append(data.copy())
