@@ -849,8 +849,10 @@ def listen_silence(
                         chunks.append(data.copy())
                         continue
 
+                    # No speech within the onset window: return promptly rather
+                    # than recording until max_seconds on every silent turn.
                     if block_index >= start_blocks and speech_run == 0:
-                        continue
+                        break
 
                 else:
                     chunks.append(data.copy())
@@ -1160,8 +1162,8 @@ def is_wake_word(text):
 
 
 def _likely_incomplete_command(text):
-    value = re.sub(r"[^a-z0-9\\s]", " ", str(text or "").lower())
-    value = re.sub(r"\\s+", " ", value).strip()
+    value = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
+    value = re.sub(r"\s+", " ", value).strip()
 
     starters = {
         "give", "tell", "explain", "describe", "show",
@@ -1175,22 +1177,25 @@ def _likely_incomplete_command(text):
 
 
 def is_standby_command(text):
-    command = text.lower().strip()
+    """Only an explicit standby instruction may disengage the active voice loop.
 
-    return command in [
+    Generic words like "wait", "cancel", or "ruk jao" are not standby.
+    """
+    command = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
+    command = re.sub(r"\s+", " ", command).strip()
+    command = re.sub(r"^(?:hey\s+)?jarvis\s+", "", command).strip()
+    return command in {
         "standby",
         "go to standby",
+        "go into standby",
+        "enter standby",
         "sleep",
-        "so jao",
+        "go to sleep",
         "so ja",
+        "so jao",
         "rest karo",
-        "wait",
         "stop listening",
-        "cancel",
-        "cancel command",
-        "bas karo",
-        "ruk jao",
-    ]
+    }
 
 
 def looks_like_action_command(text):
@@ -3463,6 +3468,7 @@ def main():
             _last_command_at = _command_now
 
             if is_standby_command(command):
+                print("[STANDBY] Explicit standby phrase accepted.", flush=True)
 
                 speak(
                     "Theek hai Boss. Main standby mein hoon."
@@ -3551,6 +3557,12 @@ def main():
                         result = {"action": "ai", "target": command}
                 else:
                     result = {"action": "ai", "target": command}
+
+            # Never let an inferred AI/repair action silently put JARVIS to sleep.
+            if result and result.get("action") == "standby" and not is_standby_command(command):
+                print("[STANDBY] Blocked inferred standby; explicit phrase required.", flush=True)
+                live_hud_activity("VOICE // Inferred standby rejected")
+                continue
 
             print(
                 f"ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸Ãƒâ€šÃ‚Â§  Action: {result.get('action')}",
