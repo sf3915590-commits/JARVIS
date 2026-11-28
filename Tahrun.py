@@ -1865,6 +1865,14 @@ def execute(result):
     # PURE STUDY MODE
     # ============================================================
 
+    if action == "computer_task":
+        from computer_tasks import execute_task
+        success, message = execute_task(result, approve=lambda operation, path: ask_for_confirmation(
+            f"Boss, {operation} existing file {path}? Is exact file ko overwrite karne ki permission do."))
+        print(f"[COMPUTER TASK] success={success}: {message}", flush=True)
+        speak(message)
+        return True, False
+
     if action == "study_mode":
         try:
             import study_mode
@@ -3508,7 +3516,8 @@ def main():
             _direct_command = re.sub(r"\byoutubeopen\b", "youtube open", _direct_command)
             _direct_command = re.sub(r"\s+", " ", _direct_command).strip()
 
-            _screen_route = _jarvis_route_screen_command(command)
+            from computer_tasks import parse_command as _computer_parse
+            _screen_route = _computer_parse(command) or _jarvis_route_screen_command(command)
             _pending_quiz_route = None if _screen_route is not None else _jarvis_route_pending_quiz(command)
             if _screen_route is not None:
                 result = _screen_route

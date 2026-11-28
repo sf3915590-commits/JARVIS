@@ -1,0 +1,3 @@
+# Optional local OCR; Tesseract executable must also be installed separately.
+# Existing MSS/Pillow/PyAutoGUI/PyWinAuto/Ollama requirements are reused.
+pytesseract>=0.3.13,<0.4

@@ -148,13 +148,50 @@ def verify_text(text: str) -> bool:
 
 
 def describe_capabilities() -> dict[str, Any]:
+    import importlib.util
+    import shutil
+    import os
+    available = lambda name: importlib.util.find_spec(name) is not None
+    gui = available('pyautogui')
+    uia = os.name == 'nt' and available('pywinauto')
     return {
-        "screenshot": True,
-        "uia_text_detection": True,
-        "click_by_text": True,
-        "typing": True,
-        "keyboard": True,
-        "scroll": True,
-        "verification": True,
-        "fixed_coordinate_only": False,
+        'screenshot': gui, 'uia_text_detection': uia,
+        'click_by_text': uia, 'typing': gui, 'keyboard': gui,
+        'scroll': gui, 'verification': uia, 'fixed_coordinate_only': False,
+        'ocr': available('pytesseract') and shutil.which('tesseract') is not None,
+        'runtime_verified': False,
     }
+
+
+def read_visible_text() -> tuple[bool, str]:
+    """On-demand local OCR. No screenshot persisted or sent to a cloud provider."""
+    try:
+        import pytesseract
+        import screen_vision
+        path = None
+        try:
+            path, *_ = screen_vision._capture()
+            from PIL import Image, ImageOps
+            with Image.open(path) as image:
+                text = pytesseract.image_to_string(ImageOps.autocontrast(image.convert('L')), timeout=10)
+            return (True, text.strip()) if text.strip() else (False, 'Readable text nahi mila.')
+        finally:
+            if path:
+                path.unlink(missing_ok=True)
+    except ImportError:
+        return False, 'Optional OCR unavailable: install pytesseract and local Tesseract engine.'
+    except Exception as exc:
+        return False, f'OCR failed: {exc}'
+
+
+def switch_window(title: str) -> tuple[bool, str]:
+    try:
+        from pywinauto import Desktop
+        matches = [w for w in Desktop(backend='uia').windows(visible_only=True)
+                   if str(title).casefold() in w.window_text().casefold()]
+        if not title.strip() or len(matches) != 1:
+            return False, 'Unique window nahi mili; exact title do.'
+        matches[0].set_focus()
+        return (True, 'Window focus verify hua.') if matches[0].has_focus() else (False, 'Window focus verify nahi hua.')
+    except Exception as exc:
+        return False, f'Window switch failed: {exc}'
